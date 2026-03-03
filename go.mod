@@ -1,6 +1,6 @@
 module github.com/cavenine/ctxpp
 
-go 1.24.2
+go 1.26.0
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.2

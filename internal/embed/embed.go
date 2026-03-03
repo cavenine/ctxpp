@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -447,4 +448,91 @@ func Detect(ctx context.Context) (Embedder, bool) {
 		}
 		return NewBundledEmbedder(ollamaDims), false
 	}
+}
+
+// ---- CachingEmbedder -------------------------------------------------------
+
+// DefaultCacheSize is the maximum number of query vectors held in memory.
+// At 1024 dims × 4 bytes each, 512 entries ≈ 2 MB.
+const DefaultCacheSize = 512
+
+// CachingEmbedder wraps an Embedder and caches query vectors in memory up to
+// a fixed capacity. When the cache is full the oldest entry (by insertion
+// order) is evicted before the new one is stored — a simple FIFO policy
+// implemented with a []string queue alongside the map.
+//
+// This is valuable at query time: the MCP server is long-lived and agents
+// often repeat identical queries within a session.
+//
+// EmbedBatch bypasses the cache and delegates directly to the inner embedder
+// (batch paths are used during indexing, not at query time).
+type CachingEmbedder struct {
+	inner   Embedder
+	maxSize int
+	mu      sync.RWMutex
+	cache   map[string][]float32
+	keys    []string // insertion-order queue for FIFO eviction
+}
+
+// NewCachingEmbedder wraps inner with a bounded query-vector cache of
+// DefaultCacheSize entries.
+func NewCachingEmbedder(inner Embedder) *CachingEmbedder {
+	return NewCachingEmbedderSize(inner, DefaultCacheSize)
+}
+
+// NewCachingEmbedderSize wraps inner with a bounded query-vector cache of
+// maxSize entries. When the cache is full the oldest entry is evicted (FIFO).
+// maxSize <= 0 is replaced with DefaultCacheSize.
+func NewCachingEmbedderSize(inner Embedder, maxSize int) *CachingEmbedder {
+	if maxSize <= 0 {
+		maxSize = DefaultCacheSize
+	}
+	return &CachingEmbedder{
+		inner:   inner,
+		maxSize: maxSize,
+		cache:   make(map[string][]float32, maxSize),
+		keys:    make([]string, 0, maxSize),
+	}
+}
+
+func (c *CachingEmbedder) Model() string { return c.inner.Model() }
+func (c *CachingEmbedder) Dims() int     { return c.inner.Dims() }
+
+// Embed returns a cached vector if available, otherwise calls the inner
+// embedder and stores the result. If the cache is at capacity the oldest
+// entry is evicted (FIFO) before the new entry is inserted.
+func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	// Fast path: read lock only.
+	c.mu.RLock()
+	if vec, ok := c.cache[text]; ok {
+		c.mu.RUnlock()
+		return vec, nil
+	}
+	c.mu.RUnlock()
+
+	// Slow path: call inner embedder then write to cache.
+	vec, err := c.inner.Embed(ctx, text)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	// Evict oldest entry if at capacity.
+	if len(c.cache) >= c.maxSize {
+		oldest := c.keys[0]
+		c.keys = c.keys[1:]
+		delete(c.cache, oldest)
+	}
+	c.cache[text] = vec
+	c.keys = append(c.keys, text)
+	c.mu.Unlock()
+
+	return vec, nil
+}
+
+// Len returns the number of entries currently in the cache.
+func (c *CachingEmbedder) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.cache)
 }
