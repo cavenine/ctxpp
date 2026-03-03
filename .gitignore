@@ -1,0 +1,28 @@
+# Build output
+ctxpp
+dist/
+
+# Index database
+.ctxpp/
+
+# MCP tool cache
+.mcp_data/
+
+# Benchmark artifacts
+bench/results/
+/tmp/
+
+# Go test cache & coverage
+*.test
+*.out
+coverage.html
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
