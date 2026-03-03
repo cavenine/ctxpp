@@ -5,9 +5,6 @@ dist/
 # Index database
 .ctxpp/
 
-# MCP tool cache
-.mcp_data/
-
 # Benchmark artifacts
 bench/results/
 /tmp/
@@ -16,6 +13,9 @@ bench/results/
 *.test
 *.out
 coverage.html
+
+# Local opencode config (machine-specific paths)
+opencode.jsonc
 
 # IDE / editor
 .idea/
