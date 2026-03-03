@@ -355,6 +355,14 @@ similarity. This finds conceptually related symbols even when the query
 uses different words than the code -- "authentication flow" can match a
 function called `HandleLogin`.
 
+**Query-vector caching**: because the MCP server is a long-lived process
+and agents frequently repeat identical queries within a session, the
+`CachingEmbedder` wrapper caches query vectors in memory. The cache holds
+up to 512 entries (≈2 MB at 1024 dims) and evicts the oldest entry (FIFO)
+when full. Cache hits skip the Ollama round-trip entirely. The cache is
+per-process and not persisted; it is distinct from the symbol-embedding
+cache in SQLite (which is keyed on source hash and persists across restarts).
+
 ### Hybrid search (default)
 
 Combines both approaches using **Reciprocal Rank Fusion (RRF)**, a
