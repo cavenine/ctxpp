@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Run tests (CTRF)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ctrf
+
+          test_status=0
+          tmp="$(mktemp)"
+          set +e
+          go test -json ./... > "$tmp"
+          test_status=$?
+          set -e
+
+          go tool go-ctrf-json-reporter -output ctrf/tests.json < "$tmp"
+          rm -f "$tmp"
+
+          if [ "$test_status" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Publish CTRF report (job summary + sticky PR comment)
+        uses: ctrf-io/github-test-reporter@v1
+        if: always()
+        with:
+          report-path: "./ctrf/*.json"
+          summary-report: true
+          failed-report: true
+          slowest-report: true
+          flaky-rate-report: true
+          insights-report: true
+          pull-request: true
+          overwrite-comment: true
+          comment-tag: "${{ github.workflow }}-${{ github.job }}"
+          upload-artifact: true
+          fetch-previous-results: true
+          report-order: "summary-report,failed-report,flaky-rate-report,slowest-report,insights-report"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
