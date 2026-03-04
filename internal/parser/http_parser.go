@@ -60,37 +60,38 @@ func (p *HTTPParser) Parse(filePath string, src []byte) (Result, error) {
 		}
 
 		m := httpMethodPattern.FindStringSubmatch(trimmed)
-		if m != nil {
-			method := m[1]
-			rawURL := m[2]
-
-			// Extract path from URL, stripping query params for the name.
-			path := extractPath(rawURL)
-			name := method + " " + path
-
-			startLine := i + 1 // 1-based
-
-			// Find the end of this request block (next ### or next request line or EOF).
-			endLine := findRequestEnd(lines, i+1)
-
-			doc := strings.Join(pendingComments, "\n")
-
-			res.Symbols = append(res.Symbols, types.Symbol{
-				ID:         fmt.Sprintf("%s:%s:%s", filePath, name, types.KindFunction),
-				File:       filePath,
-				Name:       name,
-				Kind:       types.KindFunction,
-				Signature:  trimmed,
-				DocComment: doc,
-				StartLine:  startLine,
-				EndLine:    endLine + 1, // 1-based
-			})
-
-			pendingComments = nil
-		} else {
+		if m == nil {
 			// Non-comment, non-method line — could be headers or body.
 			// Don't reset comments here; they belong to the next request.
+			continue
 		}
+
+		method := m[1]
+		rawURL := m[2]
+
+		// Extract path from URL, stripping query params for the name.
+		path := extractPath(rawURL)
+		name := method + " " + path
+
+		startLine := i + 1 // 1-based
+
+		// Find the end of this request block (next ### or next request line or EOF).
+		endLine := findRequestEnd(lines, i+1)
+
+		doc := strings.Join(pendingComments, "\n")
+
+		res.Symbols = append(res.Symbols, types.Symbol{
+			ID:         fmt.Sprintf("%s:%s:%s", filePath, name, types.KindFunction),
+			File:       filePath,
+			Name:       name,
+			Kind:       types.KindFunction,
+			Signature:  trimmed,
+			DocComment: doc,
+			StartLine:  startLine,
+			EndLine:    endLine + 1, // 1-based
+		})
+
+		pendingComments = nil
 	}
 
 	return res, nil

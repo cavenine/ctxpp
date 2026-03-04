@@ -103,17 +103,6 @@ func childByType(n *sitter.Node, typ string) *sitter.Node {
 	return nil
 }
 
-func childrenByType(n *sitter.Node, typ string) []*sitter.Node {
-	var out []*sitter.Node
-	for i := 0; i < int(n.ChildCount()); i++ {
-		c := n.Child(i)
-		if c.Type() == typ {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
 func extractPackageName(root *sitter.Node, src []byte) string {
 	clause := childByType(root, "package_clause")
 	if clause == nil {
@@ -175,11 +164,6 @@ func extractFunction(n *sitter.Node, src []byte, filePath, pkgName, receiver str
 		return nil
 	}
 	name := nodeText(nameNode, src)
-	if name == "" || name[0] < 'A' || name[0] > 'Z' {
-		// Skip unexported for now — can make configurable later.
-		// Actually include unexported too; useful for call graph.
-		// Re-include:
-	}
 
 	sig := firstLine(nodeText(n, src))
 	// Trim body brace onwards: keep only up to opening '{'.
