@@ -729,6 +729,11 @@ func TestCachingEmbedder_ConcurrentSafeMissesSameKey(t *testing.T) {
 	if keyCount != 1 {
 		t.Errorf("keys queue len = %d, want 1 (duplicate inserts detected)", keyCount)
 	}
+	// Concurrent misses for the same key must be coalesced into a single
+	// backend call — the inner embedder must be called exactly once.
+	if got := inner.callCount(); got != 1 {
+		t.Errorf("inner.callCount() = %d, want 1 backend call for concurrent misses to the same key", got)
+	}
 }
 
 // batchCountingEmbedder is a BatchEmbedder test double that records calls.

@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // Embedder converts text into a dense float32 vector.
@@ -464,14 +466,18 @@ const DefaultCacheSize = 512
 // This is valuable at query time: the MCP server is long-lived and agents
 // often repeat identical queries within a session.
 //
-// EmbedBatch bypasses the cache and delegates directly to the inner embedder
-// (batch paths are used during indexing, not at query time).
+// EmbedBatch: when the inner embedder implements BatchEmbedder, EmbedBatch
+// delegates directly to it and bypasses the cache (batch paths are used during
+// indexing, not at query time). When the inner embedder does not implement
+// BatchEmbedder, EmbedBatch falls back to calling Embed per item, which does
+// populate and use the cache.
 type CachingEmbedder struct {
 	inner   Embedder
 	maxSize int
 	mu      sync.RWMutex
 	cache   map[string][]float32
 	keys    []string // insertion-order queue for FIFO eviction
+	sf      singleflight.Group
 }
 
 // NewCachingEmbedder wraps inner with a bounded query-vector cache of
@@ -502,11 +508,11 @@ func (c *CachingEmbedder) Dims() int     { return c.inner.Dims() }
 // embedder and stores the result. If the cache is at capacity the oldest
 // entry is evicted (FIFO) before the new entry is inserted.
 //
-// Concurrency: uses a double-checked locking pattern. The read lock is
-// acquired first for the common (hit) path. On a miss the write lock is
-// acquired and the map is checked a second time before inserting, ensuring
-// that concurrent misses for the same key result in exactly one entry in
-// both cache and keys.
+// Concurrency: concurrent callers for the same text are coalesced via
+// singleflight — only one call to the inner embedder is made per unique
+// in-flight key. The read lock is acquired first for the common (hit) path;
+// on a miss the singleflight group serialises the backend call and the
+// write lock is held only during the brief cache-update step.
 func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	// Fast path: read lock only.
 	c.mu.RLock()
@@ -516,32 +522,40 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 	}
 	c.mu.RUnlock()
 
-	// Slow path: call inner embedder (outside any lock to avoid blocking
-	// readers during a potentially slow network call).
-	vec, err := c.inner.Embed(ctx, text)
+	// Slow path: coalesce concurrent misses for the same key so only one
+	// backend call is made. singleflight.Do blocks all duplicate callers
+	// until the first returns, then shares the result.
+	v, err, _ := c.sf.Do(text, func() (any, error) {
+		// Re-check cache inside singleflight in case it was populated while
+		// we were waiting to enter the group.
+		c.mu.RLock()
+		if vec, ok := c.cache[text]; ok {
+			c.mu.RUnlock()
+			return vec, nil
+		}
+		c.mu.RUnlock()
+
+		vec, err := c.inner.Embed(ctx, text)
+		if err != nil {
+			return nil, err
+		}
+
+		c.mu.Lock()
+		if len(c.cache) >= c.maxSize {
+			oldest := c.keys[0]
+			c.keys = c.keys[1:]
+			delete(c.cache, oldest)
+		}
+		c.cache[text] = vec
+		c.keys = append(c.keys, text)
+		c.mu.Unlock()
+
+		return vec, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	c.mu.Lock()
-	// Double-check: another goroutine may have inserted the same key while
-	// we were calling the inner embedder. If so, discard our result and
-	// return the cached value to keep keys/cache consistent.
-	if existing, ok := c.cache[text]; ok {
-		c.mu.Unlock()
-		return existing, nil
-	}
-	// Evict oldest entry if at capacity.
-	if len(c.cache) >= c.maxSize {
-		oldest := c.keys[0]
-		c.keys = c.keys[1:]
-		delete(c.cache, oldest)
-	}
-	c.cache[text] = vec
-	c.keys = append(c.keys, text)
-	c.mu.Unlock()
-
-	return vec, nil
+	return v.([]float32), nil
 }
 
 // Len returns the number of entries currently in the cache.
@@ -563,7 +577,7 @@ func (c *CachingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]f
 	for i, text := range texts {
 		vec, err := c.Embed(ctx, text)
 		if err != nil {
-			return nil, fmt.Errorf("EmbedBatch item %d: %w", i, err)
+			return nil, fmt.Errorf("embed batch: item %d: %w", i, err)
 		}
 		vecs[i] = vec
 	}
