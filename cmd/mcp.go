@@ -73,7 +73,9 @@ func runMCP() {
 
 	// Auto-detect embedder (Ollama preferred, bundled fallback).
 	// Wrap with CachingEmbedder so repeated identical query texts don't hit
-	// the backend on every search call.
+	// the backend on every search call. CachingEmbedder implements BatchEmbedder
+	// by delegating to the inner embedder, so indexing batch performance is
+	// fully preserved.
 	baseEmbedder, usingOllama := embed.Detect(ctx)
 	embedder := embed.NewCachingEmbedder(baseEmbedder)
 	if usingOllama {

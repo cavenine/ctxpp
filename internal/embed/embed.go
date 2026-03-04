@@ -501,6 +501,12 @@ func (c *CachingEmbedder) Dims() int     { return c.inner.Dims() }
 // Embed returns a cached vector if available, otherwise calls the inner
 // embedder and stores the result. If the cache is at capacity the oldest
 // entry is evicted (FIFO) before the new entry is inserted.
+//
+// Concurrency: uses a double-checked locking pattern. The read lock is
+// acquired first for the common (hit) path. On a miss the write lock is
+// acquired and the map is checked a second time before inserting, ensuring
+// that concurrent misses for the same key result in exactly one entry in
+// both cache and keys.
 func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	// Fast path: read lock only.
 	c.mu.RLock()
@@ -510,13 +516,21 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 	}
 	c.mu.RUnlock()
 
-	// Slow path: call inner embedder then write to cache.
+	// Slow path: call inner embedder (outside any lock to avoid blocking
+	// readers during a potentially slow network call).
 	vec, err := c.inner.Embed(ctx, text)
 	if err != nil {
 		return nil, err
 	}
 
 	c.mu.Lock()
+	// Double-check: another goroutine may have inserted the same key while
+	// we were calling the inner embedder. If so, discard our result and
+	// return the cached value to keep keys/cache consistent.
+	if existing, ok := c.cache[text]; ok {
+		c.mu.Unlock()
+		return existing, nil
+	}
 	// Evict oldest entry if at capacity.
 	if len(c.cache) >= c.maxSize {
 		oldest := c.keys[0]
@@ -535,4 +549,23 @@ func (c *CachingEmbedder) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.cache)
+}
+
+// EmbedBatch delegates to the inner embedder's EmbedBatch when available,
+// preserving batch support for indexing paths. When the inner embedder does
+// not implement BatchEmbedder, it falls back to calling Embed per item so
+// that CachingEmbedder always satisfies the BatchEmbedder interface.
+func (c *CachingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if batcher, ok := c.inner.(BatchEmbedder); ok {
+		return batcher.EmbedBatch(ctx, texts)
+	}
+	vecs := make([][]float32, len(texts))
+	for i, text := range texts {
+		vec, err := c.Embed(ctx, text)
+		if err != nil {
+			return nil, fmt.Errorf("EmbedBatch item %d: %w", i, err)
+		}
+		vecs[i] = vec
+	}
+	return vecs, nil
 }

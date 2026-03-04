@@ -51,7 +51,7 @@ ctx++ is built around three principles:
 
 ## Prerequisites
 
-- **Go 1.24+** for building from source
+- **Go 1.26+** for building from source
 - **[Ollama](https://ollama.com)** for semantic search embeddings
 
 ```bash
