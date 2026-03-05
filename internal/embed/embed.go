@@ -509,10 +509,10 @@ func (c *CachingEmbedder) Dims() int     { return c.inner.Dims() }
 // entry is evicted (FIFO) before the new entry is inserted.
 //
 // Concurrency: concurrent callers for the same text are coalesced via
-// singleflight — only one call to the inner embedder is made per unique
-// in-flight key. The read lock is acquired first for the common (hit) path;
-// on a miss the singleflight group serialises the backend call and the
-// write lock is held only during the brief cache-update step.
+// singleflight — only one backend call is made per unique in-flight key.
+// The backend call runs under context.WithoutCancel so that a short-lived or
+// cancelled leader context does not fail co-waiters that have valid contexts.
+// Each caller waits on DoChan and may bail early on its own ctx.Done().
 func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	// Fast path: read lock only.
 	c.mu.RLock()
@@ -522,10 +522,10 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 	}
 	c.mu.RUnlock()
 
-	// Slow path: coalesce concurrent misses for the same key so only one
-	// backend call is made. singleflight.Do blocks all duplicate callers
-	// until the first returns, then shares the result.
-	v, err, _ := c.sf.Do(text, func() (any, error) {
+	// Slow path: coalesce concurrent misses via DoChan so each caller can
+	// independently respect its own ctx while the single backend call runs
+	// under a context that is not tied to any one caller.
+	ch := c.sf.DoChan(text, func() (any, error) {
 		// Re-check cache inside singleflight in case it was populated while
 		// we were waiting to enter the group.
 		c.mu.RLock()
@@ -535,7 +535,10 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 		}
 		c.mu.RUnlock()
 
-		vec, err := c.inner.Embed(ctx, text)
+		// Decouple the backend call from the caller's context so that a
+		// short-deadline or cancelled leader does not propagate failure to
+		// other waiters for the same key.
+		vec, err := c.inner.Embed(context.WithoutCancel(ctx), text)
 		if err != nil {
 			return nil, err
 		}
@@ -552,10 +555,16 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 
 		return vec, nil
 	})
-	if err != nil {
-		return nil, err
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("embed: context done waiting for result: %w", ctx.Err())
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.([]float32), nil
 	}
-	return v.([]float32), nil
 }
 
 // Len returns the number of entries currently in the cache.
@@ -569,17 +578,27 @@ func (c *CachingEmbedder) Len() int {
 // preserving batch support for indexing paths. When the inner embedder does
 // not implement BatchEmbedder, it falls back to calling Embed per item so
 // that CachingEmbedder always satisfies the BatchEmbedder interface.
+//
+// Fallback error handling: individual item failures leave vecs[i] as nil and
+// are recorded; processing continues for the remaining items. The first
+// per-item error is returned alongside the partial result so that callers can
+// skip nil entries without discarding the entire batch — consistent with the
+// behaviour of RetryingEmbedder's fallback path.
 func (c *CachingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if batcher, ok := c.inner.(BatchEmbedder); ok {
 		return batcher.EmbedBatch(ctx, texts)
 	}
 	vecs := make([][]float32, len(texts))
+	var firstErr error
 	for i, text := range texts {
 		vec, err := c.Embed(ctx, text)
 		if err != nil {
-			return nil, fmt.Errorf("embed batch: item %d: %w", i, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("embed batch: item %d: %w", i, err)
+			}
+			continue // leave vecs[i] nil; caller skips nil entries
 		}
 		vecs[i] = vec
 	}
-	return vecs, nil
+	return vecs, firstErr
 }

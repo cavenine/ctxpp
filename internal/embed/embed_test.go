@@ -806,3 +806,115 @@ func TestCachingEmbedder_EmbedBatchFallsBackToEmbed(t *testing.T) {
 		t.Errorf("inner.Embed called %d times, want %d", got, len(texts))
 	}
 }
+
+// TestCachingEmbedder_EmbedBatchFallbackPartialSuccess verifies that when the
+// fallback path (no inner BatchEmbedder) encounters a per-item error, it:
+//   - continues processing remaining items rather than aborting,
+//   - returns nil vectors for failed items and real vectors for successes,
+//   - returns the first wrapped error alongside the partial result.
+func TestCachingEmbedder_EmbedBatchFallbackPartialSuccess(t *testing.T) {
+	failErr := errors.New("backend down")
+	callN := 0
+	// failOnSecond fails only the second call.
+	inner := &funcEmbedder{
+		model: "test",
+		dims:  1,
+		embedFn: func(_ context.Context, _ string) ([]float32, error) {
+			callN++
+			if callN == 2 {
+				return nil, failErr
+			}
+			return []float32{float32(callN)}, nil
+		},
+	}
+	c := NewCachingEmbedder(inner)
+
+	texts := []string{"a", "b", "c"}
+	vecs, err := c.EmbedBatch(t.Context(), texts)
+
+	// Must return an error (wrapping the per-item failure).
+	if err == nil {
+		t.Fatal("EmbedBatch() fallback: want error for partial failure, got nil")
+	}
+	// Must still return a slice of the correct length.
+	if len(vecs) != len(texts) {
+		t.Fatalf("EmbedBatch() fallback returned %d vecs, want %d", len(vecs), len(texts))
+	}
+	// Items 0 and 2 succeeded — must be non-nil.
+	if vecs[0] == nil {
+		t.Error("vecs[0] is nil, want non-nil (successful item)")
+	}
+	if vecs[2] == nil {
+		t.Error("vecs[2] is nil, want non-nil (successful item)")
+	}
+	// Item 1 failed — must be nil.
+	if vecs[1] != nil {
+		t.Error("vecs[1] is non-nil, want nil (failed item)")
+	}
+}
+
+// TestCachingEmbedder_EmbedCanceledLeaderDoesNotFailWaiters verifies that
+// when a singleflight leader's context is cancelled, other concurrent waiters
+// with valid contexts still receive a result (they do not inherit the leader's
+// cancellation).
+func TestCachingEmbedder_EmbedCanceledLeaderDoesNotFailWaiters(t *testing.T) {
+	// slow embedder that blocks until released.
+	release := make(chan struct{})
+	inner := &funcEmbedder{
+		model: "test",
+		dims:  1,
+		embedFn: func(ctx context.Context, _ string) ([]float32, error) {
+			select {
+			case <-release:
+				return []float32{1}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	c := NewCachingEmbedder(inner)
+
+	// Leader goroutine: cancellable context.
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := c.Embed(leaderCtx, "key")
+		leaderDone <- err
+	}()
+
+	// Give leader time to enter the singleflight group.
+	time.Sleep(20 * time.Millisecond)
+
+	// Waiter goroutine: long-lived context — must not be affected by leader cancel.
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := c.Embed(context.Background(), "key")
+		waiterDone <- err
+	}()
+
+	// Cancel the leader.
+	time.Sleep(10 * time.Millisecond)
+	leaderCancel()
+
+	// Allow backend to complete so waiter can succeed.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+
+	if err := <-waiterDone; err != nil {
+		t.Errorf("waiter Embed() error = %v, want nil (canceled leader must not fail waiter)", err)
+	}
+	// Leader itself may or may not error depending on timing; we don't assert it.
+}
+
+// funcEmbedder is a test double whose Embed behaviour is provided via a closure.
+type funcEmbedder struct {
+	model   string
+	dims    int
+	embedFn func(ctx context.Context, text string) ([]float32, error)
+}
+
+func (f *funcEmbedder) Model() string { return f.model }
+func (f *funcEmbedder) Dims() int     { return f.dims }
+func (f *funcEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	return f.embedFn(ctx, text)
+}
