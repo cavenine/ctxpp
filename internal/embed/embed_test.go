@@ -915,6 +915,31 @@ func TestCachingEmbedder_EmbedCanceledLeaderDoesNotFailWaiters(t *testing.T) {
 	}
 }
 
+func TestCachingEmbedder_EmbedBackendTimeoutIsBounded(t *testing.T) {
+	inner := &funcEmbedder{
+		model: "test",
+		dims:  1,
+		embedFn: func(ctx context.Context, _ string) ([]float32, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	c := NewCachingEmbedder(inner)
+	c.backendTimeout = 20 * time.Millisecond
+
+	start := time.Now()
+	_, err := c.Embed(context.Background(), "timeout-key")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Embed() error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Errorf("Embed() elapsed = %v, want <= 250ms", elapsed)
+	}
+}
+
 // funcEmbedder is a test double whose Embed behaviour is provided via a closure.
 type funcEmbedder struct {
 	model   string

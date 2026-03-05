@@ -458,6 +458,10 @@ func Detect(ctx context.Context) (Embedder, bool) {
 // At 1024 dims × 4 bytes each, 512 entries ≈ 2 MB.
 const DefaultCacheSize = 512
 
+// defaultCacheMissEmbedTimeout bounds backend work for a coalesced cache miss.
+// It prevents runaway retries when callers cancel or time out.
+const defaultCacheMissEmbedTimeout = 30 * time.Second
+
 // CachingEmbedder wraps an Embedder and caches query vectors in memory up to
 // a fixed capacity. When the cache is full the oldest entry (by insertion
 // order) is evicted before the new one is stored — a simple FIFO policy
@@ -478,6 +482,8 @@ type CachingEmbedder struct {
 	cache   map[string][]float32
 	keys    []string // insertion-order queue for FIFO eviction
 	sf      singleflight.Group
+	// backendTimeout bounds the singleflight backend call context.
+	backendTimeout time.Duration
 }
 
 // NewCachingEmbedder wraps inner with a bounded query-vector cache of
@@ -494,10 +500,11 @@ func NewCachingEmbedderSize(inner Embedder, maxSize int) *CachingEmbedder {
 		maxSize = DefaultCacheSize
 	}
 	return &CachingEmbedder{
-		inner:   inner,
-		maxSize: maxSize,
-		cache:   make(map[string][]float32, maxSize),
-		keys:    make([]string, 0, maxSize),
+		inner:          inner,
+		maxSize:        maxSize,
+		cache:          make(map[string][]float32, maxSize),
+		keys:           make([]string, 0, maxSize),
+		backendTimeout: defaultCacheMissEmbedTimeout,
 	}
 }
 
@@ -510,9 +517,10 @@ func (c *CachingEmbedder) Dims() int     { return c.inner.Dims() }
 //
 // Concurrency: concurrent callers for the same text are coalesced via
 // singleflight — only one backend call is made per unique in-flight key.
-// The backend call runs under context.WithoutCancel so that a short-lived or
-// cancelled leader context does not fail co-waiters that have valid contexts.
-// Each caller waits on DoChan and may bail early on its own ctx.Done().
+// The backend call is decoupled from any one caller's cancellation to avoid
+// leader-cancel fan-out, but is still bounded by backendTimeout so abandoned
+// requests cannot run indefinitely. Each caller waits on DoChan and may bail
+// early on its own ctx.Done().
 func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	// Fast path: read lock only.
 	c.mu.RLock()
@@ -535,10 +543,12 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 		}
 		c.mu.RUnlock()
 
-		// Decouple the backend call from the caller's context so that a
-		// short-deadline or cancelled leader does not propagate failure to
-		// other waiters for the same key.
-		vec, err := c.inner.Embed(context.WithoutCancel(ctx), text)
+		// Decouple the backend call from any single caller, but bound total
+		// backend work duration so canceled/abandoned requests do not run
+		// indefinitely.
+		backendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.backendTimeout)
+		defer cancel()
+		vec, err := c.inner.Embed(backendCtx, text)
 		if err != nil {
 			return nil, err
 		}
