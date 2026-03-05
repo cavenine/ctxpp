@@ -15,7 +15,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"testing"
 
 	"github.com/cavenine/ctxpp/internal/embed"
@@ -51,14 +50,14 @@ func generateSyntheticRepo(b *testing.B, numFiles, typesPerFile, funcsPerFile, m
 		for t := 0; t < typesPerFile; t++ {
 			typeName := fmt.Sprintf("Type%d", t)
 			code += fmt.Sprintf("// %s is a generated type for benchmarking.\ntype %s struct {\n", typeName, typeName)
-			code += fmt.Sprintf("\tName string\n\tValue int\n\tData []byte\n}\n\n")
+			code += "\tName string\n\tValue int\n\tData []byte\n}\n\n"
 
 			for m := 0; m < methodsPerFile; m++ {
 				methName := fmt.Sprintf("Method%d", m)
 				code += fmt.Sprintf("// %s performs operation %d on %s.\n", methName, m, typeName)
 				code += fmt.Sprintf("func (t *%s) %s(input string) string {\n", typeName, methName)
 				code += fmt.Sprintf("\tresult := fmt.Sprintf(\"%%s-%%d\", input, t.Value)\n")
-				code += fmt.Sprintf("\treturn strings.TrimSpace(result)\n}\n\n")
+				code += "\treturn strings.TrimSpace(result)\n}\n\n"
 			}
 		}
 
@@ -339,18 +338,4 @@ func BenchmarkDBSize_200Files(b *testing.B) {
 	if stats.SymbolsIndexed > 0 {
 		b.ReportMetric(float64(info.Size())/float64(stats.SymbolsIndexed), "bytes/symbol")
 	}
-}
-
-// percentile returns the p-th percentile of a sorted slice (0-100).
-func percentile(sorted []float64, p float64) float64 {
-	if len(sorted) == 0 {
-		return 0
-	}
-	idx := int(float64(len(sorted)-1) * p / 100)
-	return sorted[idx]
-}
-
-// sortFloat64s sorts a slice in-place.
-func sortFloat64s(s []float64) {
-	sort.Float64s(s)
 }

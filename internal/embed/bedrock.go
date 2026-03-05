@@ -183,8 +183,5 @@ func isBedrockNonRetryable(err error) bool {
 		return true
 	}
 	var quota *brtypes.ServiceQuotaExceededException
-	if errors.As(err, &quota) {
-		return true
-	}
-	return false
+	return errors.As(err, &quota)
 }
