@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -636,12 +637,16 @@ func TestHandleFeatureTraverse_PartialNameNoExactMatch(t *testing.T) {
 // is used by which code path.
 type trackingEmbedder struct {
 	embed.Embedder
-	calls int
+	calls atomic.Int64
 }
 
 func (te *trackingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
-	te.calls++
+	te.calls.Add(1)
 	return te.Embedder.Embed(ctx, text)
+}
+
+func (te *trackingEmbedder) callCount() int {
+	return int(te.calls.Load())
 }
 
 // TestHandleSearch_UsesQueryEmbedder verifies that handleSearch calls the
@@ -683,11 +688,11 @@ func TestHandleSearch_UsesQueryEmbedder(t *testing.T) {
 		t.Fatalf("handleSearch() error = %v", err)
 	}
 
-	if queryEmb.calls == 0 {
+	if queryEmb.callCount() == 0 {
 		t.Error("queryEmbedder was not called during handleSearch")
 	}
-	if indexEmb.calls != 0 {
-		t.Errorf("indexEmbedder was called %d times during handleSearch, want 0", indexEmb.calls)
+	if indexEmb.callCount() != 0 {
+		t.Errorf("indexEmbedder was called %d times during handleSearch, want 0", indexEmb.callCount())
 	}
 }
 
@@ -720,12 +725,12 @@ func TestHandleIndex_UsesIndexEmbedder(t *testing.T) {
 		root:          root,
 	}
 
-	queryCallsBefore := queryEmb.calls
+	queryCallsBefore := queryEmb.callCount()
 	if _, err := a.handleIndex(context.Background(), makeToolRequest(nil)); err != nil {
 		t.Fatalf("handleIndex() error = %v", err)
 	}
 
-	if queryEmb.calls != queryCallsBefore {
-		t.Errorf("queryEmbedder was called %d times during handleIndex, want 0", queryEmb.calls-queryCallsBefore)
+	if queryEmb.callCount() != queryCallsBefore {
+		t.Errorf("queryEmbedder was called %d times during handleIndex, want 0", queryEmb.callCount()-queryCallsBefore)
 	}
 }

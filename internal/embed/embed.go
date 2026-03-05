@@ -544,13 +544,21 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 		}
 
 		c.mu.Lock()
+		if cached, ok := c.cache[text]; ok {
+			c.mu.Unlock()
+			return cached, nil
+		}
 		if len(c.cache) >= c.maxSize {
 			oldest := c.keys[0]
-			c.keys = c.keys[1:]
 			delete(c.cache, oldest)
+			// Keep queue capacity stable by shifting in-place, then writing
+			// the new key into the last slot.
+			copy(c.keys, c.keys[1:])
+			c.keys[len(c.keys)-1] = text
+		} else {
+			c.keys = append(c.keys, text)
 		}
 		c.cache[text] = vec
-		c.keys = append(c.keys, text)
 		c.mu.Unlock()
 
 		return vec, nil
@@ -582,8 +590,7 @@ func (c *CachingEmbedder) Len() int {
 // Fallback error handling: individual item failures leave vecs[i] as nil and
 // are recorded; processing continues for the remaining items. The first
 // per-item error is returned alongside the partial result so that callers can
-// skip nil entries without discarding the entire batch — consistent with the
-// behaviour of RetryingEmbedder's fallback path.
+// skip nil entries without discarding the entire batch.
 func (c *CachingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if batcher, ok := c.inner.(BatchEmbedder); ok {
 		return batcher.EmbedBatch(ctx, texts)

@@ -858,12 +858,15 @@ func TestCachingEmbedder_EmbedBatchFallbackPartialSuccess(t *testing.T) {
 // with valid contexts still receive a result (they do not inherit the leader's
 // cancellation).
 func TestCachingEmbedder_EmbedCanceledLeaderDoesNotFailWaiters(t *testing.T) {
-	// slow embedder that blocks until released.
+	// Slow embedder that blocks until released.
 	release := make(chan struct{})
+	started := make(chan struct{})
+	var startedOnce sync.Once
 	inner := &funcEmbedder{
 		model: "test",
 		dims:  1,
 		embedFn: func(ctx context.Context, _ string) ([]float32, error) {
+			startedOnce.Do(func() { close(started) })
 			select {
 			case <-release:
 				return []float32{1}, nil
@@ -882,28 +885,34 @@ func TestCachingEmbedder_EmbedCanceledLeaderDoesNotFailWaiters(t *testing.T) {
 		leaderDone <- err
 	}()
 
-	// Give leader time to enter the singleflight group.
-	time.Sleep(20 * time.Millisecond)
+	// Wait deterministically until the backend call is in flight.
+	<-started
 
 	// Waiter goroutine: long-lived context — must not be affected by leader cancel.
 	waiterDone := make(chan error, 1)
+	waiterStarted := make(chan struct{})
 	go func() {
+		close(waiterStarted)
 		_, err := c.Embed(context.Background(), "key")
 		waiterDone <- err
 	}()
+	<-waiterStarted
 
 	// Cancel the leader.
-	time.Sleep(10 * time.Millisecond)
 	leaderCancel()
 
 	// Allow backend to complete so waiter can succeed.
-	time.Sleep(20 * time.Millisecond)
 	close(release)
 
 	if err := <-waiterDone; err != nil {
 		t.Errorf("waiter Embed() error = %v, want nil (canceled leader must not fail waiter)", err)
 	}
 	// Leader itself may or may not error depending on timing; we don't assert it.
+	select {
+	case <-leaderDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("leader goroutine did not return")
+	}
 }
 
 // funcEmbedder is a test double whose Embed behaviour is provided via a closure.
