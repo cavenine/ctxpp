@@ -811,7 +811,7 @@ func TestCachingEmbedder_EmbedBatchFallsBackToEmbed(t *testing.T) {
 // fallback path (no inner BatchEmbedder) encounters a per-item error, it:
 //   - continues processing remaining items rather than aborting,
 //   - returns nil vectors for failed items and real vectors for successes,
-//   - returns the first wrapped error alongside the partial result.
+//   - returns nil error to preserve partial progress for callers.
 func TestCachingEmbedder_EmbedBatchFallbackPartialSuccess(t *testing.T) {
 	failErr := errors.New("backend down")
 	callN := 0
@@ -832,9 +832,9 @@ func TestCachingEmbedder_EmbedBatchFallbackPartialSuccess(t *testing.T) {
 	texts := []string{"a", "b", "c"}
 	vecs, err := c.EmbedBatch(t.Context(), texts)
 
-	// Must return an error (wrapping the per-item failure).
-	if err == nil {
-		t.Fatal("EmbedBatch() fallback: want error for partial failure, got nil")
+	// Partial success must return nil error so callers can keep successful vecs.
+	if err != nil {
+		t.Fatalf("EmbedBatch() fallback: partial failure error = %v, want nil", err)
 	}
 	// Must still return a slice of the correct length.
 	if len(vecs) != len(texts) {
@@ -850,6 +850,34 @@ func TestCachingEmbedder_EmbedBatchFallbackPartialSuccess(t *testing.T) {
 	// Item 1 failed — must be nil.
 	if vecs[1] != nil {
 		t.Error("vecs[1] is non-nil, want nil (failed item)")
+	}
+}
+
+func TestCachingEmbedder_EmbedBatchFallbackAllFailReturnsError(t *testing.T) {
+	failErr := errors.New("backend down")
+	inner := &funcEmbedder{
+		model: "test",
+		dims:  1,
+		embedFn: func(_ context.Context, _ string) ([]float32, error) {
+			return nil, failErr
+		},
+	}
+	c := NewCachingEmbedder(inner)
+
+	vecs, err := c.EmbedBatch(t.Context(), []string{"a", "b", "c"})
+	if err == nil {
+		t.Fatal("EmbedBatch() fallback all-fail error = nil, want non-nil")
+	}
+	if !errors.Is(err, failErr) {
+		t.Errorf("EmbedBatch() error = %v, want wrapped %v", err, failErr)
+	}
+	if len(vecs) != 3 {
+		t.Fatalf("EmbedBatch() returned %d vecs, want 3", len(vecs))
+	}
+	for i := range vecs {
+		if vecs[i] != nil {
+			t.Errorf("vecs[%d] is non-nil, want nil", i)
+		}
 	}
 }
 

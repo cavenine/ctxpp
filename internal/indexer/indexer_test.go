@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -58,6 +59,56 @@ func (e *fakeEmbedder) Embed(_ context.Context, _ string) ([]float32, error) {
 		v[i] = 0.1
 	}
 	return v, nil
+}
+
+type flakyBatchEmbedder struct {
+	dims int
+	mu   sync.Mutex
+
+	batchCalls int
+	embedCalls int
+}
+
+func (e *flakyBatchEmbedder) Model() string { return "flaky-batch" }
+func (e *flakyBatchEmbedder) Dims() int     { return e.dims }
+
+func (e *flakyBatchEmbedder) Embed(_ context.Context, _ string) ([]float32, error) {
+	e.mu.Lock()
+	e.embedCalls++
+	e.mu.Unlock()
+	v := make([]float32, e.dims)
+	for i := range v {
+		v[i] = 0.2
+	}
+	return v, nil
+}
+
+func (e *flakyBatchEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
+	e.mu.Lock()
+	e.batchCalls++
+	call := e.batchCalls
+	e.mu.Unlock()
+
+	// First batch call fails completely to exercise indexer self-heal path.
+	if call == 1 {
+		return nil, errors.New("simulated batch failure")
+	}
+
+	vecs := make([][]float32, len(texts))
+	for i := range texts {
+		v := make([]float32, e.dims)
+		for j := range v {
+			v[j] = 0.2
+		}
+		vecs[i] = v
+	}
+	return vecs, nil
+}
+
+func (e *flakyBatchEmbedder) counts() (batchCalls, embedCalls int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.batchCalls, e.embedCalls
 }
 
 func newTestIndexerWithEmbed(t *testing.T, root string, st *store.Store) *Indexer {
@@ -840,6 +891,45 @@ func TestEmbedSymbols_EmptySlice(t *testing.T) {
 
 	// Should not panic or error with empty input.
 	idx.embedSymbols(context.Background(), nil, nil, nil)
+}
+
+func TestIndexer_BatchEmbedFailureSelfHealsWithPerItemRetry(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	emb := &flakyBatchEmbedder{dims: 3}
+	idx := New(
+		Config{ProjectRoot: root, Logger: discardLogger()},
+		st,
+		[]parser.Parser{parser.NewGoParser()},
+		emb,
+	)
+
+	writeFile(t, root, "retry.go", `package retry
+
+func A() {}
+func B() {}
+func C() {}
+`)
+
+	if _, err := idx.Index(context.Background()); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	missing, err := st.SymbolIDsWithoutEmbeddings()
+	if err != nil {
+		t.Fatalf("SymbolIDsWithoutEmbeddings() error = %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("SymbolIDsWithoutEmbeddings() = %v, want empty after retry self-heal", missing)
+	}
+
+	batchCalls, embedCalls := emb.counts()
+	if batchCalls == 0 {
+		t.Fatal("EmbedBatch() was not called, want batch path")
+	}
+	if embedCalls == 0 {
+		t.Fatal("Embed() per-item retry was not called after batch failure")
+	}
 }
 
 // ---- Watch tests -----------------------------------------------------------

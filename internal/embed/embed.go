@@ -598,15 +598,16 @@ func (c *CachingEmbedder) Len() int {
 // that CachingEmbedder always satisfies the BatchEmbedder interface.
 //
 // Fallback error handling: individual item failures leave vecs[i] as nil and
-// are recorded; processing continues for the remaining items. The first
-// per-item error is returned alongside the partial result so that callers can
-// skip nil entries without discarding the entire batch.
+// are recorded; processing continues for the remaining items. To preserve
+// partial progress for batch callers, a partial-failure batch returns vecs with
+// a nil error. An error is returned only when every item in the batch fails.
 func (c *CachingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if batcher, ok := c.inner.(BatchEmbedder); ok {
 		return batcher.EmbedBatch(ctx, texts)
 	}
 	vecs := make([][]float32, len(texts))
 	var firstErr error
+	successes := 0
 	for i, text := range texts {
 		vec, err := c.Embed(ctx, text)
 		if err != nil {
@@ -616,6 +617,10 @@ func (c *CachingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]f
 			continue // leave vecs[i] nil; caller skips nil entries
 		}
 		vecs[i] = vec
+		successes++
 	}
-	return vecs, firstErr
+	if successes == 0 && firstErr != nil {
+		return vecs, firstErr
+	}
+	return vecs, nil
 }
