@@ -72,27 +72,29 @@ func runMCP() {
 	}
 
 	// Auto-detect embedder (Ollama preferred, bundled fallback).
-	// Wrap with CachingEmbedder so repeated identical query texts don't hit
-	// the backend on every search call. CachingEmbedder implements BatchEmbedder
-	// by delegating to the inner embedder, so indexing batch performance is
-	// fully preserved.
+	// indexEmbedder is used by the indexer and watcher — no caching, so
+	// BatchEmbedder support is fully preserved and indexing batches cannot
+	// pollute or evict the query-time cache.
+	// queryEmbedder wraps indexEmbedder with CachingEmbedder so repeated
+	// identical search queries avoid hitting the backend on every call.
 	baseEmbedder, usingOllama := embed.Detect(ctx)
-	embedder := embed.NewCachingEmbedder(baseEmbedder)
+	queryEmbedder := embed.NewCachingEmbedder(baseEmbedder)
 	if usingOllama {
-		slog.Info("embedder: active", "model", embedder.Model())
+		slog.Info("embedder: active", "model", baseEmbedder.Model())
 	} else {
 		slog.Warn("No embedding backend detected -- semantic search disabled. Install Ollama (https://ollama.com) and run 'ollama pull bge-m3', or set CTXPP_EMBED_BACKEND=bedrock for AWS Bedrock.")
 	}
 
 	parsers := allParsers()
 
-	idx := indexer.New(indexer.Config{ProjectRoot: root}, st, parsers, embedder)
+	idx := indexer.New(indexer.Config{ProjectRoot: root}, st, parsers, baseEmbedder)
 
 	a := &app{
-		store:    st,
-		indexer:  idx,
-		embedder: embedder,
-		root:     root,
+		store:         st,
+		indexer:       idx,
+		indexEmbedder: baseEmbedder,
+		queryEmbedder: queryEmbedder,
+		root:          root,
 	}
 
 	s := server.NewMCPServer(

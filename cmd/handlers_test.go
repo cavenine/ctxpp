@@ -43,10 +43,11 @@ func testApp(t *testing.T, fixtureDir string) *app {
 	}
 
 	return &app{
-		store:    st,
-		indexer:  idx,
-		embedder: emb,
-		root:     fixtureDir,
+		store:         st,
+		indexer:       idx,
+		indexEmbedder: emb,
+		queryEmbedder: emb,
+		root:          fixtureDir,
 	}
 }
 
@@ -626,5 +627,105 @@ func TestHandleFeatureTraverse_PartialNameNoExactMatch(t *testing.T) {
 	text := getResultText(t, result)
 	if !strings.Contains(text, "no exact match") && !strings.Contains(text, "no symbols found") {
 		t.Errorf("handleFeatureTraverse() partial match result = %q, want error message", text)
+	}
+}
+
+// ---- embedder split tests --------------------------------------------------
+
+// trackingEmbedder records every Embed call so we can assert which embedder
+// is used by which code path.
+type trackingEmbedder struct {
+	embed.Embedder
+	calls int
+}
+
+func (te *trackingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	te.calls++
+	return te.Embedder.Embed(ctx, text)
+}
+
+// TestHandleSearch_UsesQueryEmbedder verifies that handleSearch calls the
+// queryEmbedder, not the indexEmbedder, so the cache is never polluted by
+// large indexing batches.
+func TestHandleSearch_UsesQueryEmbedder(t *testing.T) {
+	root := setupFixture(t)
+
+	base := embed.NewBundledEmbedder(768)
+	indexEmb := &trackingEmbedder{Embedder: base}
+	queryEmb := &trackingEmbedder{Embedder: base}
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	parsers := []parser.Parser{parser.NewGoParser()}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	idx := indexer.New(indexer.Config{ProjectRoot: root, Logger: logger}, st, parsers, indexEmb)
+	if _, err := idx.Index(context.Background()); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	a := &app{
+		store:         st,
+		indexer:       idx,
+		indexEmbedder: indexEmb,
+		queryEmbedder: queryEmb,
+		root:          root,
+	}
+
+	if _, err := a.handleSearch(context.Background(), makeToolRequest(map[string]any{
+		"query": "UserService",
+		"mode":  "semantic",
+	})); err != nil {
+		t.Fatalf("handleSearch() error = %v", err)
+	}
+
+	if queryEmb.calls == 0 {
+		t.Error("queryEmbedder was not called during handleSearch")
+	}
+	if indexEmb.calls != 0 {
+		t.Errorf("indexEmbedder was called %d times during handleSearch, want 0", indexEmb.calls)
+	}
+}
+
+// TestHandleIndex_UsesIndexEmbedder verifies that handleIndex calls the
+// indexEmbedder, not the queryEmbedder, so query cache entries are not evicted
+// by large indexing batches.
+func TestHandleIndex_UsesIndexEmbedder(t *testing.T) {
+	root := setupFixture(t)
+
+	base := embed.NewBundledEmbedder(768)
+	indexEmb := &trackingEmbedder{Embedder: base}
+	queryEmb := &trackingEmbedder{Embedder: base}
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	parsers := []parser.Parser{parser.NewGoParser()}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	idx := indexer.New(indexer.Config{ProjectRoot: root, Logger: logger}, st, parsers, indexEmb)
+
+	a := &app{
+		store:         st,
+		indexer:       idx,
+		indexEmbedder: indexEmb,
+		queryEmbedder: queryEmb,
+		root:          root,
+	}
+
+	queryCallsBefore := queryEmb.calls
+	if _, err := a.handleIndex(context.Background(), makeToolRequest(nil)); err != nil {
+		t.Fatalf("handleIndex() error = %v", err)
+	}
+
+	if queryEmb.calls != queryCallsBefore {
+		t.Errorf("queryEmbedder was called %d times during handleIndex, want 0", queryEmb.calls-queryCallsBefore)
 	}
 }
