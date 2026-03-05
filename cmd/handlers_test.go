@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -242,6 +243,24 @@ func TestHandleSearch_HybridDefault(t *testing.T) {
 	text := getResultText(t, result)
 	if !strings.Contains(text, "UserService") {
 		t.Errorf("handleSearch() hybrid result = %q, want 'UserService'", text)
+	}
+}
+
+func TestHandleSearch_HybridFallsBackToKeywordOnEmbedError(t *testing.T) {
+	root := setupFixture(t)
+	a := testApp(t, root)
+	a.queryEmbedder = &failingEmbedder{Embedder: a.queryEmbedder, err: errors.New("embed unavailable")}
+
+	result, err := a.handleSearch(context.Background(), makeToolRequest(map[string]any{
+		"query": "UserService",
+		"mode":  "hybrid",
+	}))
+	if err != nil {
+		t.Fatalf("handleSearch() error = %v", err)
+	}
+	text := getResultText(t, result)
+	if !strings.Contains(text, "UserService") {
+		t.Errorf("handleSearch() hybrid fallback result = %q, want 'UserService' from keyword fallback", text)
 	}
 }
 
@@ -638,6 +657,15 @@ func TestHandleFeatureTraverse_PartialNameNoExactMatch(t *testing.T) {
 type trackingEmbedder struct {
 	embed.Embedder
 	calls atomic.Int64
+}
+
+type failingEmbedder struct {
+	embed.Embedder
+	err error
+}
+
+func (f *failingEmbedder) Embed(context.Context, string) ([]float32, error) {
+	return nil, f.err
 }
 
 func (te *trackingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {

@@ -415,7 +415,7 @@ func (idx *Indexer) Index(ctx context.Context) (IndexStats, error) {
 				}
 				vecs, err := batcher.EmbedBatch(ctx, texts)
 				if err != nil {
-					idx.log.Warn("embed batch failed", "size", len(jobs), "err", err)
+					idx.log.Warn("embed batch error; retrying failed items individually", "size", len(jobs), "err", err)
 				}
 
 				failed := make([]embedJob, 0, len(jobs))

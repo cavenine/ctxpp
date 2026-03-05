@@ -58,8 +58,14 @@ func (a *app) handleSearch(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 		}
 		syms, err = a.store.SearchSemantic(vec, limit)
 	default: // hybrid
-		vec, _ := a.queryEmbedder.Embed(ctx, query)
-		syms, err = a.store.SearchHybrid(vec, query, limit)
+		vec, eerr := a.queryEmbedder.Embed(ctx, query)
+		if eerr != nil {
+			// On embed failures in hybrid mode, fall back to keyword-only search
+			// instead of running a semantic scan with an invalid vector.
+			syms, err = a.store.SearchKeyword(query, limit)
+		} else {
+			syms, err = a.store.SearchHybrid(vec, query, limit)
+		}
 	}
 
 	if err != nil {

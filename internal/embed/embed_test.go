@@ -626,13 +626,13 @@ func TestCachingEmbedder_ConcurrentSafeHits(t *testing.T) {
 	// and the inner embedder should still only have been called once.
 	const goroutines = 50
 	errs := make(chan error, goroutines)
-	for range goroutines {
+	for i := 0; i < goroutines; i++ {
 		go func() {
 			_, err := c.Embed(t.Context(), "shared")
 			errs <- err
 		}()
 	}
-	for range goroutines {
+	for i := 0; i < goroutines; i++ {
 		if err := <-errs; err != nil {
 			t.Errorf("concurrent Embed() error = %v", err)
 		}
@@ -649,7 +649,7 @@ func TestCachingEmbedder_EvictsOldestWhenFull(t *testing.T) {
 	c := NewCachingEmbedderSize(inner, maxSize)
 
 	// Fill the cache: query-0, query-1, query-2 (query-0 is oldest).
-	for i := range maxSize {
+	for i := 0; i < maxSize; i++ {
 		if _, err := c.Embed(t.Context(), fmt.Sprintf("query-%d", i)); err != nil {
 			t.Fatalf("Embed() error = %v", err)
 		}
@@ -706,13 +706,13 @@ func TestCachingEmbedder_ConcurrentSafeMissesSameKey(t *testing.T) {
 	// with no duplicate keys in the FIFO queue.
 	const goroutines = 50
 	errs := make(chan error, goroutines)
-	for range goroutines {
+	for i := 0; i < goroutines; i++ {
 		go func() {
 			_, err := c.Embed(t.Context(), "shared-miss")
 			errs <- err
 		}()
 	}
-	for range goroutines {
+	for i := 0; i < goroutines; i++ {
 		if err := <-errs; err != nil {
 			t.Errorf("concurrent Embed() error = %v", err)
 		}
@@ -878,6 +878,25 @@ func TestCachingEmbedder_EmbedBatchFallbackAllFailReturnsError(t *testing.T) {
 		if vecs[i] != nil {
 			t.Errorf("vecs[%d] is non-nil, want nil", i)
 		}
+	}
+}
+
+func TestCachingEmbedder_EmbedReturnsDefensiveCopy(t *testing.T) {
+	inner := &countingEmbedder{vec: []float32{1, 2, 3}}
+	c := NewCachingEmbedder(inner)
+
+	first, err := c.Embed(t.Context(), "copy-key")
+	if err != nil {
+		t.Fatalf("Embed() first error = %v", err)
+	}
+	first[0] = 999
+
+	second, err := c.Embed(t.Context(), "copy-key")
+	if err != nil {
+		t.Fatalf("Embed() second error = %v", err)
+	}
+	if second[0] == 999 {
+		t.Fatal("cached vector was externally mutated; expected defensive copy")
 	}
 }
 

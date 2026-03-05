@@ -511,6 +511,15 @@ func NewCachingEmbedderSize(inner Embedder, maxSize int) *CachingEmbedder {
 func (c *CachingEmbedder) Model() string { return c.inner.Model() }
 func (c *CachingEmbedder) Dims() int     { return c.inner.Dims() }
 
+func cloneVec(vec []float32) []float32 {
+	if vec == nil {
+		return nil
+	}
+	out := make([]float32, len(vec))
+	copy(out, vec)
+	return out
+}
+
 // Embed returns a cached vector if available, otherwise calls the inner
 // embedder and stores the result. If the cache is at capacity the oldest
 // entry is evicted (FIFO) before the new entry is inserted.
@@ -526,7 +535,7 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 	c.mu.RLock()
 	if vec, ok := c.cache[text]; ok {
 		c.mu.RUnlock()
-		return vec, nil
+		return cloneVec(vec), nil
 	}
 	c.mu.RUnlock()
 
@@ -539,7 +548,7 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 		c.mu.RLock()
 		if vec, ok := c.cache[text]; ok {
 			c.mu.RUnlock()
-			return vec, nil
+			return cloneVec(vec), nil
 		}
 		c.mu.RUnlock()
 
@@ -568,7 +577,7 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 		} else {
 			c.keys = append(c.keys, text)
 		}
-		c.cache[text] = vec
+		c.cache[text] = cloneVec(vec)
 		c.mu.Unlock()
 
 		return vec, nil
@@ -581,7 +590,7 @@ func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 		if res.Err != nil {
 			return nil, res.Err
 		}
-		return res.Val.([]float32), nil
+		return cloneVec(res.Val.([]float32)), nil
 	}
 }
 
