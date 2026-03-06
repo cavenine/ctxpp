@@ -934,6 +934,18 @@ func C() {}
 
 // ---- Watch tests -----------------------------------------------------------
 
+func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("condition not met before timeout")
+}
+
 func TestWatch_DetectsNewFile(t *testing.T) {
 	root := t.TempDir()
 	st := openTestStore(t)
@@ -941,7 +953,7 @@ func TestWatch_DetectsNewFile(t *testing.T) {
 	// Use a short debounce for fast tests.
 	idx.cfg.WatchDebounce = 50 * time.Millisecond
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	watchErr := make(chan error, 1)
@@ -975,6 +987,253 @@ func WatchedFunc() {}
 	}
 }
 
+func TestWatch_DetectsFileInDirectoryCreatedAfterStartup(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexer(t, root, st)
+	idx.cfg.WatchDebounce = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	watchErr := make(chan error, 1)
+	go func() {
+		watchErr <- idx.Watch(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	newDir := filepath.Join(root, "newdir")
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	// Give the watcher a moment to attach to the new directory.
+	time.Sleep(100 * time.Millisecond)
+
+	writeFile(t, newDir, "new.go", `package newdir
+
+func NewDirFunc() {}
+`)
+
+	waitFor(t, 2*time.Second, func() bool {
+		syms, err := st.GetSymbolsByFile("newdir/new.go")
+		if err != nil {
+			t.Fatalf("GetSymbolsByFile() error = %v", err)
+		}
+		return len(syms) > 0
+	})
+
+	cancel()
+	if err := <-watchErr; err != nil {
+		t.Errorf("Watch() error = %v", err)
+	}
+}
+
+func TestWatch_IndexesExistingFilesInNewlyCreatedDirectoryTree(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexer(t, root, st)
+	idx.cfg.WatchDebounce = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	watchErr := make(chan error, 1)
+	go func() {
+		watchErr <- idx.Watch(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	srcParent := t.TempDir()
+	srcTree := filepath.Join(srcParent, "imported")
+	if err := os.MkdirAll(filepath.Join(srcTree, "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	writeFile(t, filepath.Join(srcTree, "nested"), "existing.go", `package nested
+
+func Existing() {}
+`)
+
+	dstTree := filepath.Join(root, "imported")
+	if err := os.Rename(srcTree, dstTree); err != nil {
+		t.Fatalf("Rename() error = %v", err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		syms, err := st.GetSymbolsByFile("imported/nested/existing.go")
+		if err != nil {
+			t.Fatalf("GetSymbolsByFile() error = %v", err)
+		}
+		return len(syms) > 0
+	})
+
+	cancel()
+	if err := <-watchErr; err != nil {
+		t.Errorf("Watch() error = %v", err)
+	}
+}
+
+func TestWatch_ReconcilesFileCreatedWhileOfflineOnStartup(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexer(t, root, st)
+	idx.cfg.WatchDebounce = 50 * time.Millisecond
+
+	writeFile(t, root, "offline.go", `package offline
+
+func OfflineCreated() {}
+`)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	watchErr := make(chan error, 1)
+	go func() {
+		watchErr <- idx.Watch(ctx)
+	}()
+
+	waitFor(t, 2*time.Second, func() bool {
+		syms, err := st.GetSymbolsByFile("offline.go")
+		if err != nil {
+			t.Fatalf("GetSymbolsByFile() error = %v", err)
+		}
+		return len(syms) > 0
+	})
+
+	cancel()
+	if err := <-watchErr; err != nil {
+		t.Errorf("Watch() error = %v", err)
+	}
+}
+
+func TestWatch_ReconcilesDeletedFileWhileOfflineOnStartup(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexer(t, root, st)
+	idx.cfg.WatchDebounce = 50 * time.Millisecond
+
+	path := writeFile(t, root, "stale.go", `package stale
+
+func Stale() {}
+`)
+	if _, err := idx.Index(context.Background()); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	watchErr := make(chan error, 1)
+	go func() {
+		watchErr <- idx.Watch(ctx)
+	}()
+
+	waitFor(t, 2*time.Second, func() bool {
+		sha, err := st.GetFileSHA("stale.go")
+		if err != nil {
+			t.Fatalf("GetFileSHA() error = %v", err)
+		}
+		return sha == ""
+	})
+
+	cancel()
+	if err := <-watchErr; err != nil {
+		t.Errorf("Watch() error = %v", err)
+	}
+}
+
+func TestWatch_IgnoresNewNodeModulesDirectoryAfterStartup(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexer(t, root, st)
+	idx.cfg.WatchDebounce = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	watchErr := make(chan error, 1)
+	go func() {
+		watchErr <- idx.Watch(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	nmDir := filepath.Join(root, "node_modules", "pkg")
+	if err := os.MkdirAll(nmDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	writeFile(t, nmDir, "ignored.go", `package pkg
+
+func Ignored() {}
+`)
+
+	// Wait for any potential (incorrect) indexing and assert it does not happen.
+	time.Sleep(400 * time.Millisecond)
+
+	sha, err := st.GetFileSHA("node_modules/pkg/ignored.go")
+	if err != nil {
+		t.Fatalf("GetFileSHA() error = %v", err)
+	}
+	if sha != "" {
+		t.Error("node_modules/pkg/ignored.go was indexed but should be ignored")
+	}
+
+	cancel()
+	if err := <-watchErr; err != nil {
+		t.Errorf("Watch() error = %v", err)
+	}
+}
+
+func TestWatch_DeleteWatchedDirectoryDoesNotCrash(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexer(t, root, st)
+	idx.cfg.WatchDebounce = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	watchErr := make(chan error, 1)
+	go func() {
+		watchErr <- idx.Watch(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	tmpDir := filepath.Join(root, "tempdir")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if err := os.RemoveAll(tmpDir); err != nil {
+		t.Fatalf("RemoveAll() error = %v", err)
+	}
+
+	writeFile(t, root, "after.go", `package after
+
+func AfterDelete() {}
+`)
+
+	waitFor(t, 2*time.Second, func() bool {
+		syms, err := st.GetSymbolsByFile("after.go")
+		if err != nil {
+			t.Fatalf("GetSymbolsByFile() error = %v", err)
+		}
+		return len(syms) > 0
+	})
+
+	cancel()
+	if err := <-watchErr; err != nil {
+		t.Errorf("Watch() error = %v", err)
+	}
+}
+
 func TestWatch_DetectsModifiedFile(t *testing.T) {
 	root := t.TempDir()
 	st := openTestStore(t)
@@ -990,7 +1249,7 @@ func OldFunc() {}
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	watchErr := make(chan error, 1)
@@ -1042,7 +1301,7 @@ func DelFunc() {}
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	watchErr := make(chan error, 1)

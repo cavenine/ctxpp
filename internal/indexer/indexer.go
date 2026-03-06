@@ -606,6 +606,8 @@ func (idx *Indexer) Watch(ctx context.Context) error {
 	}
 	defer watcher.Close()
 
+	gi := loadGitignore(idx.cfg.ProjectRoot)
+
 	// Walk and add all directories.
 	if err := filepath.WalkDir(idx.cfg.ProjectRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
@@ -620,23 +622,15 @@ func (idx *Indexer) Watch(ctx context.Context) error {
 		return fmt.Errorf("indexer: watch walk: %w", err)
 	}
 
-	gi := loadGitignore(idx.cfg.ProjectRoot)
+	idx.reconcileStartup(ctx, gi)
+
 	debounce := make(map[string]*time.Timer)
 	var mu sync.Mutex
 
 	reindex := func(absPath string) {
-		rel, err := filepath.Rel(idx.cfg.ProjectRoot, absPath)
-		if err != nil {
+		rel, ext, ok, _ := idx.watchFileInfo(absPath, gi)
+		if !ok {
 			return
-		}
-		if gi != nil && gi.MatchesPath(rel) {
-			return
-		}
-		ext := strings.ToLower(filepath.Ext(absPath))
-		if _, ok := idx.parsers[ext]; !ok {
-			if _, ok := idx.filenames[filepath.Base(absPath)]; !ok {
-				return
-			}
 		}
 		if _, _, err := idx.indexFile(ctx, absPath, rel, ext); err != nil {
 			idx.log.Error("watch reindex", "path", rel, "err", err)
@@ -657,6 +651,16 @@ func (idx *Indexer) Watch(ctx context.Context) error {
 					idx.log.Warn("watch delete", "path", rel, "err", err)
 				}
 				continue
+			}
+			if event.Has(fsnotify.Create) {
+				info, err := os.Stat(event.Name)
+				if err == nil && info.IsDir() {
+					idx.addWatchDirsRecursive(ctx, watcher, event.Name, gi)
+					continue
+				}
+				if err != nil && !os.IsNotExist(err) {
+					idx.log.Warn("watch stat create path", "path", event.Name, "err", err)
+				}
 			}
 			if !event.Has(fsnotify.Write) && !event.Has(fsnotify.Create) {
 				continue
@@ -680,6 +684,149 @@ func (idx *Indexer) Watch(ctx context.Context) error {
 			idx.log.Warn("watcher error", "err", err)
 		}
 	}
+}
+
+// addWatchDirsRecursive walks a newly created directory tree and adds all
+// eligible directories to fsnotify. It also indexes supported files already
+// present in that tree so pre-populated creates (e.g. rename/extract) are
+// visible immediately without waiting for another event.
+func (idx *Indexer) addWatchDirsRecursive(ctx context.Context, watcher *fsnotify.Watcher, root string, gi *gitignore.GitIgnore) {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			idx.log.Warn("watch walk new dir", "path", path, "err", err)
+			return nil
+		}
+		if d.IsDir() {
+			if idx.shouldSkipWatchDir(path, d.Name(), gi) {
+				return filepath.SkipDir
+			}
+			if err := watcher.Add(path); err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				idx.log.Warn("watch add dir", "path", path, "err", err)
+			}
+			return nil
+		}
+		rel, ext, ok, err := idx.watchFileInfo(path, gi)
+		if err != nil {
+			idx.log.Warn("watch rel file", "path", path, "err", err)
+			return nil
+		}
+		if !ok {
+			return nil
+		}
+		if _, _, err := idx.indexFile(ctx, path, rel, ext); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			idx.log.Warn("watch index existing file", "path", rel, "err", err)
+		}
+		return nil
+	})
+}
+
+// shouldSkipWatchDir reports whether a directory should be excluded from watch
+// registration and reconcile walks using the same hidden/node_modules/
+// .gitignore policy as indexing.
+func (idx *Indexer) shouldSkipWatchDir(path, base string, gi *gitignore.GitIgnore) bool {
+	if base != "." && (strings.HasPrefix(base, ".") || base == "node_modules") {
+		return true
+	}
+	rel, err := filepath.Rel(idx.cfg.ProjectRoot, path)
+	if err != nil {
+		return true
+	}
+	if rel == "." {
+		return false
+	}
+	if gi != nil && gi.MatchesPath(rel) {
+		return true
+	}
+	return false
+}
+
+// reconcileStartup catches up filesystem changes missed while watcher was not
+// running: it indexes supported files currently on disk and removes stale file
+// rows for indexed paths that no longer exist.
+func (idx *Indexer) reconcileStartup(ctx context.Context, gi *gitignore.GitIgnore) {
+	seen := make(map[string]struct{})
+
+	_ = filepath.WalkDir(idx.cfg.ProjectRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			idx.log.Warn("watch reconcile walk", "path", path, "err", err)
+			return nil
+		}
+		if d.IsDir() {
+			if idx.shouldSkipWatchDir(path, d.Name(), gi) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, ext, ok, err := idx.watchFileInfo(path, gi)
+		if err != nil {
+			idx.log.Warn("watch reconcile rel", "path", path, "err", err)
+			return nil
+		}
+		if !ok {
+			return nil
+		}
+		seen[rel] = struct{}{}
+		if _, _, err := idx.indexFile(ctx, path, rel, ext); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			idx.log.Warn("watch reconcile index", "path", rel, "err", err)
+		}
+		return nil
+	})
+
+	indexedFiles, err := idx.store.ListFiles()
+	if err != nil {
+		idx.log.Warn("watch reconcile list files", "err", err)
+		return
+	}
+	for _, rel := range indexedFiles {
+		if _, ok := seen[rel]; ok {
+			continue
+		}
+		absPath := filepath.Join(idx.cfg.ProjectRoot, rel)
+		if _, err := os.Stat(absPath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			idx.log.Warn("watch reconcile stat indexed file", "path", rel, "err", err)
+			continue
+		}
+		if err := idx.store.DeleteFile(rel); err != nil {
+			idx.log.Warn("watch reconcile delete stale", "path", rel, "err", err)
+		}
+	}
+}
+
+// watchFileInfo returns repo-relative path and parser key extension for files
+// eligible for watch indexing. If ok is false and err is nil, the file is
+// ignored (gitignore or unsupported extension/name).
+func (idx *Indexer) watchFileInfo(absPath string, gi *gitignore.GitIgnore) (rel string, ext string, ok bool, err error) {
+	rel, err = filepath.Rel(idx.cfg.ProjectRoot, absPath)
+	if err != nil {
+		return "", "", false, fmt.Errorf("rel %s: %w", absPath, err)
+	}
+	if gi != nil && gi.MatchesPath(rel) {
+		return "", "", false, nil
+	}
+	ext = strings.ToLower(filepath.Ext(absPath))
+	if _, ok := idx.parsers[ext]; !ok {
+		if _, ok := idx.filenames[filepath.Base(absPath)]; !ok {
+			return "", "", false, nil
+		}
+	}
+	return rel, ext, true, nil
 }
 
 // ---- helpers ---------------------------------------------------------------

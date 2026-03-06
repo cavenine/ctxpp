@@ -607,6 +607,55 @@ func TestGetFileSHA_ReturnsStoredHash(t *testing.T) {
 	}
 }
 
+func TestListFiles_Empty(t *testing.T) {
+	st := openTestStore(t)
+
+	got, err := st.ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListFiles() len = %d, want 0", len(got))
+	}
+}
+
+func TestListFiles_ReturnsIndexedPaths(t *testing.T) {
+	st := openTestStore(t)
+
+	files := []types.FileRecord{
+		{Path: "a.go", SHA256: "sha-a", ModTime: 1, Lang: "go"},
+		{Path: "pkg/b.go", SHA256: "sha-b", ModTime: 2, Lang: "go"},
+		{Path: "cmd/main.go", SHA256: "sha-c", ModTime: 3, Lang: "go"},
+	}
+	for _, f := range files {
+		if err := st.UpsertFile(f); err != nil {
+			t.Fatalf("UpsertFile(%q) error = %v", f.Path, err)
+		}
+	}
+
+	got, err := st.ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles() error = %v", err)
+	}
+	if len(got) != len(files) {
+		t.Fatalf("ListFiles() len = %d, want %d", len(got), len(files))
+	}
+
+	wantSet := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		wantSet[f.Path] = struct{}{}
+	}
+	for _, p := range got {
+		if _, ok := wantSet[p]; !ok {
+			t.Fatalf("ListFiles() unexpected path %q", p)
+		}
+		delete(wantSet, p)
+	}
+	if len(wantSet) != 0 {
+		t.Fatalf("ListFiles() missing paths: %v", wantSet)
+	}
+}
+
 func TestGetSymbolsByNames_ReturnsMatchingSymbols(t *testing.T) {
 	st := openTestStore(t)
 
