@@ -628,18 +628,9 @@ func (idx *Indexer) Watch(ctx context.Context) error {
 	var mu sync.Mutex
 
 	reindex := func(absPath string) {
-		rel, err := filepath.Rel(idx.cfg.ProjectRoot, absPath)
-		if err != nil {
+		rel, ext, ok, _ := idx.watchFileInfo(absPath, gi)
+		if !ok {
 			return
-		}
-		if gi != nil && gi.MatchesPath(rel) {
-			return
-		}
-		ext := strings.ToLower(filepath.Ext(absPath))
-		if _, ok := idx.parsers[ext]; !ok {
-			if _, ok := idx.filenames[filepath.Base(absPath)]; !ok {
-				return
-			}
 		}
 		if _, _, err := idx.indexFile(ctx, absPath, rel, ext); err != nil {
 			idx.log.Error("watch reindex", "path", rel, "err", err)
@@ -720,19 +711,13 @@ func (idx *Indexer) addWatchDirsRecursive(ctx context.Context, watcher *fsnotify
 			}
 			return nil
 		}
-		rel, err := filepath.Rel(idx.cfg.ProjectRoot, path)
+		rel, ext, ok, err := idx.watchFileInfo(path, gi)
 		if err != nil {
 			idx.log.Warn("watch rel file", "path", path, "err", err)
 			return nil
 		}
-		if gi != nil && gi.MatchesPath(rel) {
+		if !ok {
 			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if _, ok := idx.parsers[ext]; !ok {
-			if _, ok := idx.filenames[filepath.Base(path)]; !ok {
-				return nil
-			}
 		}
 		if _, _, err := idx.indexFile(ctx, path, rel, ext); err != nil {
 			if os.IsNotExist(err) {
@@ -784,19 +769,13 @@ func (idx *Indexer) reconcileStartup(ctx context.Context, gi *gitignore.GitIgnor
 			}
 			return nil
 		}
-		rel, err := filepath.Rel(idx.cfg.ProjectRoot, path)
+		rel, ext, ok, err := idx.watchFileInfo(path, gi)
 		if err != nil {
 			idx.log.Warn("watch reconcile rel", "path", path, "err", err)
 			return nil
 		}
-		if gi != nil && gi.MatchesPath(rel) {
+		if !ok {
 			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if _, ok := idx.parsers[ext]; !ok {
-			if _, ok := idx.filenames[filepath.Base(path)]; !ok {
-				return nil
-			}
 		}
 		seen[rel] = struct{}{}
 		if _, _, err := idx.indexFile(ctx, path, rel, ext); err != nil {
@@ -828,6 +807,26 @@ func (idx *Indexer) reconcileStartup(ctx context.Context, gi *gitignore.GitIgnor
 			idx.log.Warn("watch reconcile delete stale", "path", rel, "err", err)
 		}
 	}
+}
+
+// watchFileInfo returns repo-relative path and parser key extension for files
+// eligible for watch indexing. If ok is false and err is nil, the file is
+// ignored (gitignore or unsupported extension/name).
+func (idx *Indexer) watchFileInfo(absPath string, gi *gitignore.GitIgnore) (rel string, ext string, ok bool, err error) {
+	rel, err = filepath.Rel(idx.cfg.ProjectRoot, absPath)
+	if err != nil {
+		return "", "", false, fmt.Errorf("rel %s: %w", absPath, err)
+	}
+	if gi != nil && gi.MatchesPath(rel) {
+		return "", "", false, nil
+	}
+	ext = strings.ToLower(filepath.Ext(absPath))
+	if _, ok := idx.parsers[ext]; !ok {
+		if _, ok := idx.filenames[filepath.Base(absPath)]; !ok {
+			return "", "", false, nil
+		}
+	}
+	return rel, ext, true, nil
 }
 
 // ---- helpers ---------------------------------------------------------------
