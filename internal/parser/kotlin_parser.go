@@ -247,10 +247,3 @@ func hasChildType(n *sitter.Node, want string) bool {
 	}
 	return false
 }
-
-func qualifiedMemberName(receiver, name string) string {
-	if receiver == "" {
-		return name
-	}
-	return receiver + "." + name
-}
