@@ -25,9 +25,11 @@ func allParsers() []parser.Parser {
 	return []parser.Parser{
 		parser.NewGoParser(),
 		parser.NewJavaParser(),
+		parser.NewKotlinParser(),
 		parser.NewJavaScriptParser(),
 		parser.NewTypeScriptParser(),
 		parser.NewRustParser(),
+		parser.NewCSharpParser(),
 		parser.NewCParser(),
 		parser.NewCppParser(),
 		parser.NewSQLParser(),

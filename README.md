@@ -35,9 +35,11 @@ ctx++ is built around three principles:
 |---|---|---|
 | Go | `.go` | functions, methods, structs, interfaces, types, constants, variables |
 | Java | `.java` | classes, interfaces, enums, methods, constructors, fields |
+| Kotlin | `.kt`, `.kts` | functions, methods, classes, interfaces, properties, imports |
 | JavaScript | `.js`, `.mjs`, `.cjs`, `.jsx` | functions, classes, methods, arrow functions |
 | TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` | functions, classes, interfaces, type aliases, enums |
 | Rust | `.rs` | functions, structs, enums, traits, impl methods, type aliases |
+| C# | `.cs` | classes, interfaces, methods, fields, imports |
 | C | `.c`, `.h` | functions, structs, enums, typedefs, function-like macros |
 | C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx` | functions, methods, classes, structs, enums, namespaces, templates |
 | SQL | `.sql` | tables, views, indexes, functions, procedures, triggers |
@@ -47,6 +49,8 @@ ctx++ is built around three principles:
 | Protobuf | `.proto` | messages, services, RPCs, enums |
 | HTTP | `.http`, `.rest` | named requests |
 | Text/Config | `.txt`, `.env`, `Makefile`, `Dockerfile`, `LICENSE`, etc. | file-level document symbol |
+
+Want to add another language? See `docs/ADDING-LANGUAGE-SUPPORT.md` for a step-by-step implementation template and PR checklist.
 
 ---
 

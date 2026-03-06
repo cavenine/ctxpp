@@ -1,0 +1,182 @@
+package parser
+
+import (
+	"os"
+	"testing"
+
+	"github.com/cavenine/ctxpp/internal/types"
+)
+
+func parseCSharpFixture(t *testing.T, filename string) Result {
+	t.Helper()
+	src, err := os.ReadFile("testdata/" + filename)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", filename, err)
+	}
+	p := NewCSharpParser()
+	result, err := p.Parse(filename, src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	return result
+}
+
+func TestCSharpParser_Language(t *testing.T) {
+	p := NewCSharpParser()
+	if got := p.Language(); got != "csharp" {
+		t.Errorf("Language() = %q, want %q", got, "csharp")
+	}
+}
+
+func TestCSharpParser_Extensions(t *testing.T) {
+	p := NewCSharpParser()
+	got := p.Extensions()
+	if len(got) != 1 || got[0] != ".cs" {
+		t.Errorf("Extensions() = %v, want [.cs]", got)
+	}
+}
+
+func TestCSharpParser_ExtractsSymbolsAndImports(t *testing.T) {
+	result := parseCSharpFixture(t, "widget.cs")
+
+	tests := []struct {
+		name         string
+		symbol       string
+		wantKind     types.SymbolKind
+		wantReceiver string
+		wantPackage  string
+	}{
+		{name: "class", symbol: "Widget", wantKind: types.KindStruct, wantPackage: "Demo.App"},
+		{name: "interface", symbol: "IRenderer", wantKind: types.KindInterface, wantPackage: "Demo.App"},
+		{name: "field", symbol: "count", wantKind: types.KindField, wantReceiver: "Widget", wantPackage: "Demo.App"},
+		{name: "method", symbol: "Render", wantKind: types.KindMethod, wantReceiver: "Widget", wantPackage: "Demo.App"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sym := findSymbol(result.Symbols, tc.symbol)
+			if sym == nil {
+				t.Fatalf("symbol %q not found", tc.symbol)
+			}
+			if sym.Kind != tc.wantKind {
+				t.Errorf("Kind = %q, want %q", sym.Kind, tc.wantKind)
+			}
+			if sym.Receiver != tc.wantReceiver {
+				t.Errorf("Receiver = %q, want %q", sym.Receiver, tc.wantReceiver)
+			}
+			if sym.Package != tc.wantPackage {
+				t.Errorf("Package = %q, want %q", sym.Package, tc.wantPackage)
+			}
+		})
+	}
+
+	imports := map[string]bool{}
+	for _, edge := range result.ImportEdges {
+		imports[edge.ImportedPath] = true
+	}
+	for _, want := range []string{"System", "Demo.Rendering"} {
+		if !imports[want] {
+			t.Errorf("missing import edge %q", want)
+		}
+	}
+}
+
+func TestCSharpParser_ExtractsCallEdges(t *testing.T) {
+	result := parseCSharpFixture(t, "widget.cs")
+
+	callees := map[string]bool{}
+	for _, edge := range result.CallEdges {
+		if edge.CallerSymbol == "Render" {
+			callees[edge.CalleeSymbol] = true
+		}
+	}
+
+	for _, want := range []string{"WriteLine", "Helper"} {
+		if !callees[want] {
+			t.Errorf("missing callee %q for Render", want)
+		}
+	}
+}
+
+func TestCSharpParser_UsesReceiverQualifiedIDsForMembers(t *testing.T) {
+	src := []byte(`namespace Demo.App;
+
+public class First {
+	private int count;
+	public void Render() {}
+}
+
+public class Second {
+	private int count;
+	public void Render() {}
+}
+`)
+
+	p := NewCSharpParser()
+	result, err := p.Parse("widget.cs", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	wantIDs := map[string]bool{
+		"widget.cs:First.count:field":    true,
+		"widget.cs:Second.count:field":   true,
+		"widget.cs:First.Render:method":  true,
+		"widget.cs:Second.Render:method": true,
+	}
+	for _, sym := range result.Symbols {
+		delete(wantIDs, sym.ID)
+	}
+	for id := range wantIDs {
+		t.Errorf("missing qualified symbol ID %q", id)
+	}
+}
+
+func TestCSharpParser_ExtractsBlockScopedNamespaceOnly(t *testing.T) {
+	src := []byte(`namespace Demo.App {
+    public class Widget {}
+}
+`)
+
+	p := NewCSharpParser()
+	result, err := p.Parse("widget.cs", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	sym := findSymbol(result.Symbols, "Widget")
+	if sym == nil {
+		t.Fatal("symbol Widget not found")
+	}
+	if sym.Package != "Demo.App" {
+		t.Errorf("Package = %q, want %q", sym.Package, "Demo.App")
+	}
+}
+
+func TestCSharpParser_ExtractsAliasedUsingTarget(t *testing.T) {
+	src := []byte(`using IO = System.IO;
+using System.Text;
+
+namespace Demo.App;
+
+public class Widget {}
+`)
+
+	p := NewCSharpParser()
+	result, err := p.Parse("widget.cs", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	imports := map[string]bool{}
+	for _, edge := range result.ImportEdges {
+		imports[edge.ImportedPath] = true
+	}
+	for _, want := range []string{"System.IO", "System.Text"} {
+		if !imports[want] {
+			t.Errorf("missing import edge %q", want)
+		}
+	}
+	if imports["IO.System.IO"] {
+		t.Errorf("unexpected aliased import path %q", "IO.System.IO")
+	}
+}
