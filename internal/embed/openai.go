@@ -135,7 +135,11 @@ func (e *OpenAIEmbedder) doEmbed(ctx context.Context, texts []string) ([][]float
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, e.httpError(resp)
+		err := e.httpError(resp)
+		if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError && resp.StatusCode != http.StatusTooManyRequests {
+			return nil, NewNonRetryableError(err)
+		}
+		return nil, err
 	}
 
 	var result openAIEmbedResponse

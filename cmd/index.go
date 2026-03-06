@@ -70,8 +70,8 @@ func runIndex(path string, force bool) {
 	}
 	defer st.Close()
 
-	embedder, usingOllama := embed.Detect(ctx)
-	if usingOllama {
+	embedder, usingExternal := embed.Detect(ctx)
+	if usingExternal {
 		slog.Info("embedder: active", "model", embedder.Model())
 	} else {
 		fmt.Fprintln(os.Stderr, "WARNING: No embedding backend detected -- indexing with keyword search only.")

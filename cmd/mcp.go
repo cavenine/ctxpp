@@ -77,9 +77,9 @@ func runMCP() {
 	// pollute or evict the query-time cache.
 	// queryEmbedder wraps indexEmbedder with CachingEmbedder so repeated
 	// identical search queries avoid hitting the backend on every call.
-	baseEmbedder, usingOllama := embed.Detect(ctx)
+	baseEmbedder, usingExternal := embed.Detect(ctx)
 	queryEmbedder := embed.NewCachingEmbedder(baseEmbedder)
-	if usingOllama {
+	if usingExternal {
 		slog.Info("embedder: active", "model", baseEmbedder.Model())
 	} else {
 		slog.Warn("No embedding backend detected -- semantic search disabled. Install Ollama (https://ollama.com) and run 'ollama pull bge-m3', or configure OpenAI/Bedrock: set CTXPP_EMBED_BACKEND=openai with CTXPP_OPENAI_MODEL and CTXPP_OPENAI_DIMS, or set CTXPP_EMBED_BACKEND=bedrock. See README for details.")

@@ -662,8 +662,8 @@ func TestOpenAIEmbedder_EmbedBatch_MissingIndex(t *testing.T) {
 
 func TestOpenAIEmbedder_Embed_ServerErrorIncludesAPIMessage(t *testing.T) {
 	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
 		json.NewEncoder(w).Encode(openAIErrorResponse{Error: &struct {
 			Message string `json:"message"`
 			Type    string `json:"type"`
@@ -677,6 +677,27 @@ func TestOpenAIEmbedder_Embed_ServerErrorIncludesAPIMessage(t *testing.T) {
 	}
 	if got := err.Error(); !strings.Contains(got, "rate limit") {
 		t.Fatalf("Embed() error = %q, want API message", got)
+	}
+}
+
+func TestOpenAIEmbedder_Embed_ClientErrorIsNonRetryable(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(openAIErrorResponse{Error: &struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+		}{Message: "bad key"}})
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want HTTP error")
+	}
+	var nonRetryable *NonRetryableError
+	if !errors.As(err, &nonRetryable) {
+		t.Fatalf("Embed() error = %T, want *NonRetryableError", err)
 	}
 }
 
