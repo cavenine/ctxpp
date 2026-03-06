@@ -155,6 +155,12 @@ func cppHandleDecl(n *sitter.Node, src []byte, filePath, receiver string, res *R
 			res.ImportEdges = append(res.ImportEdges, *edge)
 		}
 
+	case "alias_declaration":
+		edge := cppExtractUsing(n, src, filePath)
+		if edge != nil {
+			res.ImportEdges = append(res.ImportEdges, *edge)
+		}
+
 	case "enum_class_specifier":
 		// enum class Color { ... };
 		sym := cppEnumClassSymbol(n, src, filePath)
@@ -192,7 +198,7 @@ func cppFunctionSymbol(n *sitter.Node, src []byte, filePath, enclosingClass stri
 		sig = strings.TrimSpace(sig[:idx])
 	}
 	return &types.Symbol{
-		ID:         symbolID(filePath, name, kind),
+		ID:         symbolID(filePath, qualifiedMemberName(recv, name), kind),
 		File:       filePath,
 		Name:       name,
 		Kind:       kind,
@@ -253,7 +259,7 @@ func cppFieldDeclSymbols(n *sitter.Node, src []byte, filePath, receiver string) 
 			kind = types.KindFunction
 		}
 		syms = append(syms, types.Symbol{
-			ID:        symbolID(filePath, name, kind),
+			ID:        symbolID(filePath, qualifiedMemberName(receiver, name), kind),
 			File:      filePath,
 			Name:      name,
 			Kind:      kind,
@@ -310,6 +316,12 @@ func cppEnumClassSymbol(n *sitter.Node, src []byte, filePath string) *types.Symb
 
 // cppExtractUsing extracts a using_declaration or using_directive as an import edge.
 func cppExtractUsing(n *sitter.Node, src []byte, filePath string) *types.ImportEdge {
+	if typeNode := n.ChildByFieldName("type"); typeNode != nil {
+		return &types.ImportEdge{
+			ImporterFile: filePath,
+			ImportedPath: nodeText(typeNode, src),
+		}
+	}
 	// using std::string;  or  using namespace std;
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)

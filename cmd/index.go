@@ -15,6 +15,7 @@ import (
 
 func newIndexCmd() *cobra.Command {
 	var path string
+	var force bool
 
 	cmd := &cobra.Command{
 		Use:   "index",
@@ -23,22 +24,24 @@ func newIndexCmd() *cobra.Command {
 and store them in the local index database (.ctxpp/index.db).
 
 Subsequent runs are incremental: files whose content has not changed since the
-last index pass are skipped. Use 'backfill' to re-embed symbols after switching
+last index pass are skipped. Use --force after parser changes to reprocess
+unchanged files, or use 'backfill' to re-embed symbols after switching
 embedding backends.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runIndex(path)
+			runIndex(path, force)
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVarP(&path, "path", "p", "", "Path to the project root (default: $CTXPP_PROJECT or current directory)")
+	cmd.Flags().BoolVar(&force, "force", false, "Reindex unchanged files even when file content hashes match")
 
 	return cmd
 }
 
 // runIndex is the "ctxpp index" subcommand.
 // It opens the store, detects the embedder, indexes, prints stats, and exits.
-func runIndex(path string) {
+func runIndex(path string, force bool) {
 	ctx := context.Background()
 
 	root := path
@@ -76,7 +79,7 @@ func runIndex(path string) {
 		fmt.Fprintln(os.Stderr, "         or set CTXPP_EMBED_BACKEND=bedrock for AWS Bedrock.")
 	}
 
-	idx := indexer.New(indexer.Config{ProjectRoot: root}, st, allParsers(), embedder)
+	idx := indexer.New(indexer.Config{ProjectRoot: root, Force: force}, st, allParsers(), embedder)
 	stats, err := idx.Index(ctx)
 	if err != nil {
 		slog.Error("index", "err", err)

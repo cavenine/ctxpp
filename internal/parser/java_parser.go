@@ -179,8 +179,9 @@ func javaExtractMethod(n *sitter.Node, src []byte, filePath, receiver string) *t
 	if n.Type() == "constructor_declaration" {
 		kind = types.KindFunction
 	}
+	idName := qualifiedMemberName(receiver, name)
 	return &types.Symbol{
-		ID:         symbolID(filePath, name, kind),
+		ID:         symbolID(filePath, idName, kind),
 		File:       filePath,
 		Name:       name,
 		Kind:       kind,
@@ -209,13 +210,14 @@ func javaExtractFields(n *sitter.Node, src []byte, filePath, pkg string) []types
 		}
 		name := nodeText(nameNode, src)
 		syms = append(syms, types.Symbol{
-			ID:        symbolID(filePath, name, types.KindField),
+			ID:        symbolID(filePath, qualifiedMemberName(pkg, name), types.KindField),
 			File:      filePath,
 			Name:      name,
 			Kind:      types.KindField,
 			Signature: firstLine(nodeText(n, src)),
 			StartLine: int(n.StartPoint().Row) + 1,
 			EndLine:   int(n.EndPoint().Row) + 1,
+			Receiver:  pkg,
 			Package:   pkg,
 		})
 	}

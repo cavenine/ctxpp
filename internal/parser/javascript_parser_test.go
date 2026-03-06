@@ -171,3 +171,32 @@ func TestJavaScriptParser_RecordsLineNumbers(t *testing.T) {
 		t.Errorf("EndLine %d < StartLine %d", sym.EndLine, sym.StartLine)
 	}
 }
+
+func TestJavaScriptParser_UsesReceiverQualifiedIDsForClassMethods(t *testing.T) {
+	src := []byte(`
+class First {
+  render() {}
+}
+
+class Second {
+  render() {}
+}
+`)
+
+	p := NewJavaScriptParser()
+	result, err := p.Parse("widget.js", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	wantIDs := map[string]bool{
+		"widget.js:First.render:method":  true,
+		"widget.js:Second.render:method": true,
+	}
+	for _, sym := range result.Symbols {
+		delete(wantIDs, sym.ID)
+	}
+	for id := range wantIDs {
+		t.Errorf("missing qualified symbol ID %q", id)
+	}
+}

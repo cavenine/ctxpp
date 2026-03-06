@@ -182,3 +182,61 @@ func TestRustParser_PopulatesSnippet(t *testing.T) {
 		t.Errorf("Snippet length %d exceeds maxSnippetBytes %d", len(sym.Snippet), maxSnippetBytes)
 	}
 }
+
+func TestRustParser_UsesReceiverQualifiedIDsForMethods(t *testing.T) {
+	src := []byte(`
+struct First;
+struct Second;
+
+impl First {
+    fn render(&self) {}
+}
+
+impl Second {
+    fn render(&self) {}
+}
+`)
+
+	p := NewRustParser()
+	result, err := p.Parse("widget.rs", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	wantIDs := map[string]bool{
+		"widget.rs:First.render:method":  true,
+		"widget.rs:Second.render:method": true,
+	}
+	for _, sym := range result.Symbols {
+		delete(wantIDs, sym.ID)
+	}
+	for id := range wantIDs {
+		t.Errorf("missing qualified symbol ID %q", id)
+	}
+}
+
+func TestRustParser_ExtractsAliasedUseTarget(t *testing.T) {
+	src := []byte(`
+use std::io as io;
+use crate::fmt::Display;
+`)
+
+	p := NewRustParser()
+	result, err := p.Parse("widget.rs", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	imports := map[string]bool{}
+	for _, edge := range result.ImportEdges {
+		imports[edge.ImportedPath] = true
+	}
+	for _, want := range []string{"std::io", "crate::fmt::Display"} {
+		if !imports[want] {
+			t.Errorf("missing import edge %q", want)
+		}
+	}
+	if imports["std::io as io"] {
+		t.Errorf("unexpected aliased import path %q", "std::io as io")
+	}
+}

@@ -100,6 +100,12 @@ This creates `.ctxpp/index.db` in the project root. Add it to `.gitignore`:
 
 Subsequent runs only re-process changed files. Branch switches self-heal automatically via the file watcher.
 
+If parser logic changes but your source files do not, force a full reparse of supported files:
+
+```bash
+ctxpp index --path /path/to/your/project --force
+```
+
 ### 2. Add to your MCP config
 
 The examples below use Ollama with `bge-m3` (the default). If Ollama is not running, omit `CTXPP_OLLAMA_*` — ctx++ will fall back to keyword search only.
@@ -314,7 +320,7 @@ All configuration is via environment variables.
 ## CLI Reference
 
 ```
-ctxpp index [--path/-p <path>]     Index or reindex a project (default: $CTXPP_PROJECT or current directory)
+ctxpp index [--path/-p <path>] [--force]  Index or reindex a project (default: $CTXPP_PROJECT or current directory)
 ctxpp backfill [--path/-p <path>]  Re-embed symbols missing embedding vectors
 ctxpp mcp                          Start the MCP server over stdio
 ctxpp version                      Print version

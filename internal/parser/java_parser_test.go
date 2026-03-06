@@ -144,3 +144,36 @@ func TestJavaParser_RecordsLineNumbers(t *testing.T) {
 		t.Errorf("EndLine %d < StartLine %d", sym.EndLine, sym.StartLine)
 	}
 }
+
+func TestJavaParser_UsesReceiverQualifiedIDsForMembers(t *testing.T) {
+	src := []byte(`
+class First {
+    int count;
+    void render() {}
+}
+
+class Second {
+    int count;
+    void render() {}
+}
+`)
+
+	p := NewJavaParser()
+	result, err := p.Parse("Widget.java", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	wantIDs := map[string]bool{
+		"Widget.java:First.count:field":    true,
+		"Widget.java:Second.count:field":   true,
+		"Widget.java:First.render:method":  true,
+		"Widget.java:Second.render:method": true,
+	}
+	for _, sym := range result.Symbols {
+		delete(wantIDs, sym.ID)
+	}
+	for id := range wantIDs {
+		t.Errorf("missing qualified symbol ID %q", id)
+	}
+}

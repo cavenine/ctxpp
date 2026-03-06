@@ -46,6 +46,11 @@ type Config struct {
 	// Logger is the structured logger used by the indexer.
 	// Defaults to slog.Default() if nil.
 	Logger *slog.Logger
+
+	// Force disables unchanged-file SHA skipping for Index() runs.
+	// Useful after parser changes when file contents are unchanged but extracted
+	// symbols or edges may differ.
+	Force bool
 }
 
 func (c *Config) setDefaults() {
@@ -526,7 +531,7 @@ func (idx *Indexer) parseFile(absPath, relPath, ext string) (parsedFile, error) 
 	if err != nil {
 		return parsedFile{}, fmt.Errorf("get sha %s: %w", relPath, err)
 	}
-	if stored == sha {
+	if !idx.cfg.Force && stored == sha {
 		idx.log.Debug("skip unchanged", "path", relPath)
 		return parsedFile{relPath: relPath, skipped: true}, nil
 	}

@@ -133,8 +133,9 @@ func rustFunctionSymbol(n *sitter.Node, src []byte, filePath, receiver string) *
 	if idx := strings.Index(sig, "{"); idx >= 0 {
 		sig = strings.TrimSpace(sig[:idx])
 	}
+	idName := qualifiedMemberName(receiver, name)
 	return &types.Symbol{
-		ID:         symbolID(filePath, name, kind),
+		ID:         symbolID(filePath, idName, kind),
 		File:       filePath,
 		Name:       name,
 		Kind:       kind,
@@ -217,17 +218,38 @@ func rustImplReceiver(n *sitter.Node, src []byte) string {
 func rustExtractImport(n *sitter.Node, src []byte, filePath string) *types.ImportEdge {
 	// use_declaration contains a scoped_identifier, use_list, or identifier.
 	// We grab the text of the whole use path as the imported path.
+	if argument := n.ChildByFieldName("argument"); argument != nil {
+		path := rustImportPath(argument, src)
+		if path != "" {
+			return &types.ImportEdge{ImporterFile: filePath, ImportedPath: path}
+		}
+	}
 	for i := 0; i < int(n.ChildCount()); i++ {
 		c := n.Child(i)
 		switch c.Type() {
 		case "scoped_identifier", "identifier", "use_wildcard", "use_as_clause":
-			return &types.ImportEdge{
-				ImporterFile: filePath,
-				ImportedPath: strings.TrimSuffix(nodeText(c, src), "::*"),
+			path := rustImportPath(c, src)
+			if path != "" {
+				return &types.ImportEdge{ImporterFile: filePath, ImportedPath: path}
 			}
 		}
 	}
 	return nil
+}
+
+func rustImportPath(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	if n.Type() == "use_as_clause" {
+		if path := n.ChildByFieldName("path"); path != nil {
+			return strings.TrimSuffix(nodeText(path, src), "::*")
+		}
+	}
+	if n.Type() == "use_wildcard" {
+		return strings.TrimSuffix(nodeText(n, src), "::*")
+	}
+	return strings.TrimSuffix(nodeText(n, src), "::*")
 }
 
 // rustExtractCalls walks a function body collecting call_expression nodes.
