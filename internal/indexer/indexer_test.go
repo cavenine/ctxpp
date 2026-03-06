@@ -522,6 +522,54 @@ func Hello() {}
 	}
 }
 
+func TestIndexer_ForceReindexesUnchangedFile(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := New(
+		Config{ProjectRoot: root, Logger: discardLogger(), Force: true},
+		st,
+		[]parser.Parser{parser.NewGoParser()},
+		embed.NewBundledEmbedder(3),
+	)
+
+	src := `package main
+
+func Hello() {}
+`
+	writeFile(t, root, "main.go", src)
+
+	if _, err := idx.Index(t.Context()); err != nil {
+		t.Fatalf("first Index() error = %v", err)
+	}
+
+	sha1, err := st.GetFileSHA("main.go")
+	if err != nil || sha1 == "" {
+		t.Fatalf("expected SHA after first index, got %q err %v", sha1, err)
+	}
+	if err := st.UpsertFile(types.FileRecord{Path: "main.go", SHA256: sha1, ModTime: 0, Lang: "go"}); err != nil {
+		t.Fatalf("UpsertFile() error = %v", err)
+	}
+	if err := st.DeleteSymbolsByFile("main.go"); err != nil {
+		t.Fatalf("DeleteSymbolsByFile() error = %v", err)
+	}
+
+	stats, err := idx.Index(t.Context())
+	if err != nil {
+		t.Fatalf("second Index() error = %v", err)
+	}
+	if stats.FilesSkipped != 0 {
+		t.Errorf("FilesSkipped = %d, want 0 when force reindex is enabled", stats.FilesSkipped)
+	}
+
+	syms, err := st.GetSymbolsByFile("main.go")
+	if err != nil {
+		t.Fatalf("GetSymbolsByFile() error = %v", err)
+	}
+	if len(syms) == 0 {
+		t.Fatal("expected symbols after forced reindex, got none")
+	}
+}
+
 // ---- hashBytes Benchmarks --------------------------------------------------
 
 func BenchmarkHashBytes_1KB(b *testing.B) {

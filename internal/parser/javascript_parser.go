@@ -191,7 +191,7 @@ func jsClassMembers(classNode *sitter.Node, src []byte, filePath, className stri
 				sig = strings.TrimSpace(sig[:idx])
 			}
 			syms = append(syms, types.Symbol{
-				ID:        symbolID(filePath, name, types.KindMethod),
+				ID:        symbolID(filePath, qualifiedMemberName(className, name), types.KindMethod),
 				File:      filePath,
 				Name:      name,
 				Kind:      types.KindMethod,

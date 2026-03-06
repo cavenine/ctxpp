@@ -213,3 +213,61 @@ func TestCppParser_PopulatesSnippet(t *testing.T) {
 		t.Errorf("Snippet length %d exceeds maxSnippetBytes %d", len(sym.Snippet), maxSnippetBytes)
 	}
 }
+
+func TestCppParser_UsesReceiverQualifiedIDsForMethods(t *testing.T) {
+	src := []byte(`
+class First {
+public:
+    void render() {}
+};
+
+class Second {
+public:
+    void render() {}
+};
+`)
+
+	p := NewCppParser()
+	result, err := p.Parse("widget.hpp", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	wantIDs := map[string]bool{
+		"widget.hpp:First.render:method":  true,
+		"widget.hpp:Second.render:method": true,
+	}
+	for _, sym := range result.Symbols {
+		delete(wantIDs, sym.ID)
+	}
+	for id := range wantIDs {
+		t.Errorf("missing qualified symbol ID %q", id)
+	}
+}
+
+func TestCppParser_ExtractsUsingAliasTarget(t *testing.T) {
+	src := []byte(`
+using Vec = std::vector<int>;
+using namespace std;
+using std::string;
+`)
+
+	p := NewCppParser()
+	result, err := p.Parse("widget.hpp", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	imports := map[string]bool{}
+	for _, edge := range result.ImportEdges {
+		imports[edge.ImportedPath] = true
+	}
+	for _, want := range []string{"std::vector<int>", "std", "std::string"} {
+		if !imports[want] {
+			t.Errorf("missing import edge %q", want)
+		}
+	}
+	if imports["Vec"] {
+		t.Errorf("unexpected alias import path %q", "Vec")
+	}
+}

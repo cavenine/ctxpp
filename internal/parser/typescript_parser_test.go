@@ -158,3 +158,32 @@ export default Greeting;
 		t.Errorf("Kind = %q, want %q", sym.Kind, types.KindFunction)
 	}
 }
+
+func TestTypeScriptParser_UsesReceiverQualifiedIDsForClassMethods(t *testing.T) {
+	src := []byte(`
+class First {
+  render(): void {}
+}
+
+class Second {
+  render(): void {}
+}
+`)
+
+	p := NewTypeScriptParser()
+	result, err := p.Parse("widget.ts", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	wantIDs := map[string]bool{
+		"widget.ts:First.render:method":  true,
+		"widget.ts:Second.render:method": true,
+	}
+	for _, sym := range result.Symbols {
+		delete(wantIDs, sym.ID)
+	}
+	for id := range wantIDs {
+		t.Errorf("missing qualified symbol ID %q", id)
+	}
+}
