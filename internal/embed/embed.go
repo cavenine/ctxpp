@@ -386,9 +386,9 @@ func (r *RetryingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 //
 // Environment variables:
 //
-//	CTXPP_EMBED_BACKEND    "auto" (default), "ollama", "tei", "bedrock", or "bundled"
+//	CTXPP_EMBED_BACKEND    "auto" (default), "ollama", "tei", "bedrock", "openai", or "bundled"
 //	CTXPP_OLLAMA_URL       Ollama base URL (default http://localhost:11434)
-//	CTXPP_OLLAMA_MODEL     Ollama model name (default all-minilm)
+//	CTXPP_OLLAMA_MODEL     Ollama model name (default bge-m3)
 //	CTXPP_OLLAMA_SOCKET    Unix domain socket path (optional; bypasses TCP)
 //	CTXPP_TEI_URL          TEI base URL (default http://localhost:8080)
 //	CTXPP_TEI_MODEL        TEI model identifier (default sentence-transformers/all-MiniLM-L6-v2)
@@ -396,6 +396,10 @@ func (r *RetryingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 //	CTXPP_BEDROCK_REGION   AWS region (default us-east-1)
 //	CTXPP_BEDROCK_MODEL    Bedrock model ID (default amazon.titan-embed-text-v2:0)
 //	CTXPP_BEDROCK_DIMS     Bedrock embedding dimensions: 256, 512, or 1024 (default 1024)
+//	CTXPP_OPENAI_URL       OpenAI-compatible base URL (default https://api.openai.com)
+//	CTXPP_OPENAI_MODEL     OpenAI-compatible embedding model name (required when backend=openai)
+//	CTXPP_OPENAI_API_KEY   Optional bearer token for OpenAI-compatible APIs
+//	CTXPP_OPENAI_DIMS      Embedding dimensions for the selected model (required when backend=openai)
 func Detect(ctx context.Context) (Embedder, bool) {
 	backend := os.Getenv("CTXPP_EMBED_BACKEND")
 	ollamaURL := os.Getenv("CTXPP_OLLAMA_URL")
@@ -406,6 +410,10 @@ func Detect(ctx context.Context) (Embedder, bool) {
 	bedrockRegion := os.Getenv("CTXPP_BEDROCK_REGION")
 	bedrockModel := os.Getenv("CTXPP_BEDROCK_MODEL")
 	bedrockDimsStr := os.Getenv("CTXPP_BEDROCK_DIMS")
+	openAIURL := os.Getenv("CTXPP_OPENAI_URL")
+	openAIModel := os.Getenv("CTXPP_OPENAI_MODEL")
+	openAIAPIKey := os.Getenv("CTXPP_OPENAI_API_KEY")
+	openAIDimsStr := os.Getenv("CTXPP_OPENAI_DIMS")
 
 	retryCfg := RetryConfig{} // uses defaults: 3 retries, 100ms base backoff
 
@@ -439,6 +447,13 @@ func Detect(ctx context.Context) (Embedder, bool) {
 			BaseBackoff: 500 * time.Millisecond,
 		}
 		return NewRetryingEmbedder(e, bedrockRetryCfg), true
+	case "openai":
+		openAIDims, err := strconv.Atoi(openAIDimsStr)
+		if err != nil || openAIDims <= 0 || openAIModel == "" {
+			return NewBundledEmbedder(ollamaDims), false
+		}
+		e := NewOpenAIEmbedder(openAIURL, openAIModel, openAIAPIKey, openAIDims)
+		return NewRetryingEmbedder(e, retryCfg), true
 	default: // "auto" or empty: probe TEI first, then Ollama, then bundled
 		tei := NewTEIEmbedder(teiURL, teiModel, 0)
 		if err := tei.Ping(ctx); err == nil {

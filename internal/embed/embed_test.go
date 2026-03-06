@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -454,6 +455,272 @@ func TestOllamaEmbedder_Ping_Failure(t *testing.T) {
 
 	if err := e.Ping(context.Background()); err == nil {
 		t.Error("Ping() error = nil, want error for 503")
+	}
+}
+
+func newTestOpenAIServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *OpenAIEmbedder) {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	e := NewOpenAIEmbedder(srv.URL, "test-model", "test-key", 3)
+	return srv, e
+}
+
+func TestOpenAIEmbedder_Embed_Success(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/embeddings" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("Authorization = %q, want %q", got, "Bearer test-key")
+		}
+
+		var req openAIEmbedRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.Model != "test-model" {
+			t.Errorf("request model = %q, want %q", req.Model, "test-model")
+		}
+		if len(req.Input) != 1 || req.Input[0] != "hello world" {
+			t.Errorf("request input = %v, want [hello world]", req.Input)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}}},
+		})
+	})
+
+	vec, err := e.Embed(context.Background(), "hello world")
+	if err != nil {
+		t.Fatalf("Embed() error = %v", err)
+	}
+	if len(vec) != 3 || vec[0] != 0.1 || vec[1] != 0.2 || vec[2] != 0.3 {
+		t.Errorf("Embed() = %v, want [0.1 0.2 0.3]", vec)
+	}
+}
+
+func TestOpenAIEmbedder_Embed_OmitsAuthorizationWhenAPIKeyUnset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want empty header", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}}},
+		})
+	}))
+	defer srv.Close()
+
+	e := NewOpenAIEmbedder(srv.URL, "test-model", "", 3)
+	if _, err := e.Embed(context.Background(), "hello world"); err != nil {
+		t.Fatalf("Embed() error = %v", err)
+	}
+}
+
+func TestDetect_RespectsEmbedBackendOpenAI(t *testing.T) {
+	t.Setenv("CTXPP_EMBED_BACKEND", "openai")
+	t.Setenv("CTXPP_OPENAI_URL", "https://example.com")
+	t.Setenv("CTXPP_OPENAI_MODEL", "text-embedding-3-small")
+	t.Setenv("CTXPP_OPENAI_DIMS", "1536")
+
+	e, usingExternal := Detect(context.Background())
+	if !usingExternal {
+		t.Fatal("Detect() usingExternal = false, want true")
+	}
+	re, ok := e.(*RetryingEmbedder)
+	if !ok {
+		t.Fatalf("Detect() returned %T, want *RetryingEmbedder", e)
+	}
+	oe, ok := re.inner.(*OpenAIEmbedder)
+	if !ok {
+		t.Fatalf("inner = %T, want *OpenAIEmbedder", re.inner)
+	}
+	if oe.Model() != "text-embedding-3-small" {
+		t.Errorf("Model() = %q, want %q", oe.Model(), "text-embedding-3-small")
+	}
+	if oe.Dims() != 1536 {
+		t.Errorf("Dims() = %d, want 1536", oe.Dims())
+	}
+}
+
+func TestOpenAIEmbedder_EmbedBatch_ReordersByIndex(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{
+				{Index: 1, Embedding: []float32{1, 1, 1}},
+				{Index: 0, Embedding: []float32{0, 0, 0}},
+			},
+		})
+	})
+
+	vecs, err := e.EmbedBatch(context.Background(), []string{"first", "second"})
+	if err != nil {
+		t.Fatalf("EmbedBatch() error = %v", err)
+	}
+	if got := vecs[0][0]; got != 0 {
+		t.Errorf("vecs[0][0] = %v, want 0", got)
+	}
+	if got := vecs[1][0]; got != 1 {
+		t.Errorf("vecs[1][0] = %v, want 1", got)
+	}
+}
+
+func TestOpenAIEmbedder_Embed_InvalidJSON(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("not json"))
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want decode error")
+	}
+}
+
+func TestOpenAIEmbedder_Embed_EmptyData(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{Data: []openAIEmbedData{}})
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want empty response error")
+	}
+}
+
+func TestOpenAIEmbedder_EmbedBatch_CountMismatch(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}}},
+		})
+	})
+
+	_, err := e.EmbedBatch(context.Background(), []string{"first", "second"})
+	if err == nil {
+		t.Fatal("EmbedBatch() error = nil, want count mismatch error")
+	}
+}
+
+func TestOpenAIEmbedder_Embed_DimsMismatch(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{{Index: 0, Embedding: []float32{0.1, 0.2}}},
+		})
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want dims mismatch error")
+	}
+}
+
+func TestOpenAIEmbedder_EmbedBatch_DuplicateIndex(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{
+				{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}},
+				{Index: 0, Embedding: []float32{0.4, 0.5, 0.6}},
+			},
+		})
+	})
+
+	_, err := e.EmbedBatch(context.Background(), []string{"first", "second"})
+	if err == nil {
+		t.Fatal("EmbedBatch() error = nil, want duplicate index error")
+	}
+}
+
+func TestOpenAIEmbedder_EmbedBatch_MissingIndex(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{
+				{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}},
+				{Index: 2, Embedding: []float32{0.4, 0.5, 0.6}},
+			},
+		})
+	})
+
+	_, err := e.EmbedBatch(context.Background(), []string{"first", "second"})
+	if err == nil {
+		t.Fatal("EmbedBatch() error = nil, want missing index error")
+	}
+}
+
+func TestOpenAIEmbedder_Embed_ServerErrorIncludesAPIMessage(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(openAIErrorResponse{Error: &struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+		}{Message: "rate limit"}})
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want HTTP error")
+	}
+	if got := err.Error(); !strings.Contains(got, "rate limit") {
+		t.Fatalf("Embed() error = %q, want API message", got)
+	}
+}
+
+func TestOpenAIEmbedder_Embed_ClientErrorIsNonRetryable(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(openAIErrorResponse{Error: &struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+		}{Message: "bad key"}})
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want HTTP error")
+	}
+	var nonRetryable *NonRetryableError
+	if !errors.As(err, &nonRetryable) {
+		t.Fatalf("Embed() error = %T, want *NonRetryableError", err)
+	}
+}
+
+func TestOpenAIEmbedder_Embed_InvalidConfiguration(t *testing.T) {
+	e := NewOpenAIEmbedder("https://example.com", "", "", 0)
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want configuration error")
+	}
+}
+
+func TestDetect_OpenAIInvalidDimsFallsBackToBundled(t *testing.T) {
+	t.Setenv("CTXPP_EMBED_BACKEND", "openai")
+	t.Setenv("CTXPP_OPENAI_MODEL", "text-embedding-3-small")
+	t.Setenv("CTXPP_OPENAI_DIMS", "not-a-number")
+
+	e, usingExternal := Detect(context.Background())
+	if usingExternal {
+		t.Fatal("Detect() usingExternal = true, want false")
+	}
+	if e.Model() != bundledModel {
+		t.Errorf("Model() = %q, want %q", e.Model(), bundledModel)
 	}
 }
 

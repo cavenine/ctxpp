@@ -302,6 +302,52 @@ Bedrock is the right choice for CI/CD pipelines, cloud-hosted agents, or develop
 
 ---
 
+## OpenAI-Compatible Embeddings Integration
+
+ctx++ can also use any provider that exposes the OpenAI `POST /v1/embeddings` API. This includes OpenAI, OpenAI-compatible proxies, vLLM, LiteLLM, LocalAI, and Ollama's OpenAI-compatible endpoint.
+
+Set `CTXPP_EMBED_BACKEND=openai` and configure:
+
+- `CTXPP_OPENAI_URL`
+- `CTXPP_OPENAI_MODEL`
+- `CTXPP_OPENAI_DIMS`
+- `CTXPP_OPENAI_API_KEY` (optional for local unauthenticated servers)
+
+Example with OpenAI hosted embeddings:
+
+```json
+{
+  "mcpServers": {
+    "ctxpp": {
+      "command": "ctxpp",
+      "args": ["mcp"],
+      "env": {
+        "CTXPP_PROJECT": "/path/to/your/project",
+        "CTXPP_EMBED_BACKEND": "openai",
+        "CTXPP_OPENAI_URL": "https://api.openai.com",
+        "CTXPP_OPENAI_MODEL": "text-embedding-3-small",
+        "CTXPP_OPENAI_DIMS": "1536",
+        "CTXPP_OPENAI_API_KEY": "${OPENAI_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+Example with Ollama's OpenAI-compatible endpoint:
+
+```bash
+export CTXPP_EMBED_BACKEND=openai
+export CTXPP_OPENAI_URL=http://localhost:11434
+export CTXPP_OPENAI_MODEL=bge-m3
+export CTXPP_OPENAI_DIMS=1024
+ctxpp index --path /path/to/your/project
+```
+
+This backend is opt-in only. Auto-detection still prefers TEI, then Ollama, then bundled fallback.
+
+---
+
 ## Configuration
 
 All configuration is via environment variables.
@@ -311,9 +357,13 @@ All configuration is via environment variables.
 | `CTXPP_PROJECT` | `.` | Path to the project root to index |
 | `CTXPP_OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
 | `CTXPP_OLLAMA_MODEL` | `bge-m3` | Ollama embedding model |
-| `CTXPP_EMBED_BACKEND` | _(auto-detect)_ | Embedding backend: `ollama` or `bedrock` |
+| `CTXPP_EMBED_BACKEND` | _(auto-detect)_ | Embedding backend: `auto`, `ollama`, `tei`, `openai`, `bedrock`, or `bundled` |
+| `CTXPP_OPENAI_URL` | `https://api.openai.com` | OpenAI-compatible embeddings API base URL |
+| `CTXPP_OPENAI_MODEL` | _(required with `openai`)_ | OpenAI-compatible embedding model |
+| `CTXPP_OPENAI_API_KEY` | _(optional)_ | Bearer token for OpenAI-compatible providers |
+| `CTXPP_OPENAI_DIMS` | _(required with `openai`)_ | Embedding dimensions for the selected OpenAI-compatible model |
 | `CTXPP_WORKERS` | number of CPUs | Parallel workers for initial indexing |
-| `CTXPP_EMBED_CONCURRENCY` | `10` | Max concurrent embedding requests (Bedrock) |
+| `CTXPP_EMBED_CONCURRENCY` | `10` | Max concurrent embedding requests (mainly Bedrock) |
 
 ---
 
