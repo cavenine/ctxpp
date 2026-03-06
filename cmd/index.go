@@ -24,9 +24,9 @@ func newIndexCmd() *cobra.Command {
 and store them in the local index database (.ctxpp/index.db).
 
 Subsequent runs are incremental: files whose content has not changed since the
-		last index pass are skipped. Use --force after parser changes to reprocess
-		unchanged files, or use 'backfill' to re-embed symbols after switching
-		embedding backends.`,
+last index pass are skipped. Use --force after parser changes to reprocess
+unchanged files, or use 'backfill' to re-embed symbols after switching
+embedding backends.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runIndex(path, force)
 			return nil
