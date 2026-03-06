@@ -213,6 +213,28 @@ func (s *Store) DeleteFile(path string) error {
 	return err
 }
 
+// ListFiles returns all indexed file paths.
+func (s *Store) ListFiles() ([]string, error) {
+	rows, err := s.rdb.Query(`SELECT path FROM files`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
 // ---- Symbols ---------------------------------------------------------------
 
 // DeleteSymbolsByFile removes all symbols for a file before re-inserting.
