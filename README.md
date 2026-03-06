@@ -1,5 +1,6 @@
-# ctx++
+![ctx++](ctxpp.png)
 
+# ctx++
 Fast, accurate codebase intelligence for AI coding agents.
 
 ctx++ is an MCP (Model Context Protocol) server that gives AI agents precise, structured understanding of large codebases. It extracts symbols using native tree-sitter parsing, indexes them in SQLite with both full-text and vector search, and traces call graphs to automatically map how features are assembled across files -- no hand-maintained documentation required.
