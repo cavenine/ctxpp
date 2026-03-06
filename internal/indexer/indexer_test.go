@@ -121,6 +121,16 @@ func newTestIndexerWithEmbed(t *testing.T, root string, st *store.Store) *Indexe
 	)
 }
 
+func newTestIndexerWithParsers(t *testing.T, root string, st *store.Store, parsers ...parser.Parser) *Indexer {
+	t.Helper()
+	return New(
+		Config{ProjectRoot: root, Logger: discardLogger()},
+		st,
+		parsers,
+		embed.NewBundledEmbedder(3),
+	)
+}
+
 func writeFile(t *testing.T, dir, name, content string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
@@ -128,6 +138,15 @@ func writeFile(t *testing.T, dir, name, content string) string {
 		t.Fatalf("WriteFile(%q) error = %v", name, err)
 	}
 	return path
+}
+
+func findSymbolByName(syms []types.Symbol, name string) *types.Symbol {
+	for i := range syms {
+		if syms[i].Name == name {
+			return &syms[i]
+		}
+	}
+	return nil
 }
 
 func TestIndexer_SkipsHiddenDirectories(t *testing.T) {
@@ -193,6 +212,105 @@ func Real() {}
 	}
 	if indexed == "" {
 		t.Error("real.go was not indexed but should have been")
+	}
+}
+
+func TestIndexer_IndexesKotlinFiles(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexerWithParsers(t, root, st, parser.NewKotlinParser())
+
+	writeFile(t, root, "widget.kt", `package demo
+
+class Widget {
+	fun render() {}
+}
+`)
+
+	if _, err := idx.Index(t.Context()); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	sha, err := st.GetFileSHA("widget.kt")
+	if err != nil {
+		t.Fatalf("GetFileSHA() error = %v", err)
+	}
+	if sha == "" {
+		t.Fatal("widget.kt was not indexed")
+	}
+
+	syms, err := st.GetSymbolsByFile("widget.kt")
+	if err != nil {
+		t.Fatalf("GetSymbolsByFile() error = %v", err)
+	}
+	if findSymbolByName(syms, "Widget") == nil {
+		t.Fatal("indexed Kotlin symbols missing Widget")
+	}
+}
+
+func TestIndexer_IndexesCSharpFiles(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexerWithParsers(t, root, st, parser.NewCSharpParser())
+
+	writeFile(t, root, "widget.cs", `namespace Demo.App;
+
+public class Widget {
+	public void Render() {}
+}
+`)
+
+	if _, err := idx.Index(t.Context()); err != nil {
+		t.Fatalf("Index() error = %v", err)
+	}
+
+	sha, err := st.GetFileSHA("widget.cs")
+	if err != nil {
+		t.Fatalf("GetFileSHA() error = %v", err)
+	}
+	if sha == "" {
+		t.Fatal("widget.cs was not indexed")
+	}
+
+	syms, err := st.GetSymbolsByFile("widget.cs")
+	if err != nil {
+		t.Fatalf("GetSymbolsByFile() error = %v", err)
+	}
+	if findSymbolByName(syms, "Widget") == nil {
+		t.Fatal("indexed C# symbols missing Widget")
+	}
+}
+
+func TestIndexer_WatchFileInfoRecognizesKotlinAndCSharp(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexerWithParsers(t, root, st, parser.NewKotlinParser(), parser.NewCSharpParser())
+
+	tests := []struct {
+		name string
+		file string
+	}{
+		{name: "kotlin", file: "widget.kt"},
+		{name: "csharp", file: "widget.cs"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeFile(t, root, tc.file, "")
+			rel, ext, ok, err := idx.watchFileInfo(path, nil)
+			if err != nil {
+				t.Fatalf("watchFileInfo() error = %v", err)
+			}
+			if !ok {
+				t.Fatal("watchFileInfo() ok = false, want true")
+			}
+			if rel != tc.file {
+				t.Errorf("rel = %q, want %q", rel, tc.file)
+			}
+			if ext != filepath.Ext(tc.file) {
+				t.Errorf("ext = %q, want %q", ext, filepath.Ext(tc.file))
+			}
+		})
 	}
 }
 
