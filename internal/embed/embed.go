@@ -12,7 +12,10 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // Embedder converts text into a dense float32 vector.
@@ -447,4 +450,186 @@ func Detect(ctx context.Context) (Embedder, bool) {
 		}
 		return NewBundledEmbedder(ollamaDims), false
 	}
+}
+
+// ---- CachingEmbedder -------------------------------------------------------
+
+// DefaultCacheSize is the maximum number of query vectors held in memory.
+// At 1024 dims × 4 bytes each, 512 entries ≈ 2 MB.
+const DefaultCacheSize = 512
+
+// defaultCacheMissEmbedTimeout bounds backend work for a coalesced cache miss.
+// It prevents runaway retries when callers cancel or time out.
+const defaultCacheMissEmbedTimeout = 30 * time.Second
+
+// CachingEmbedder wraps an Embedder and caches query vectors in memory up to
+// a fixed capacity. When the cache is full the oldest entry (by insertion
+// order) is evicted before the new one is stored — a simple FIFO policy
+// implemented with a []string queue alongside the map.
+//
+// This is valuable at query time: the MCP server is long-lived and agents
+// often repeat identical queries within a session.
+//
+// EmbedBatch: when the inner embedder implements BatchEmbedder, EmbedBatch
+// delegates directly to it and bypasses the cache (batch paths are used during
+// indexing, not at query time). When the inner embedder does not implement
+// BatchEmbedder, EmbedBatch falls back to calling Embed per item, which does
+// populate and use the cache.
+type CachingEmbedder struct {
+	inner   Embedder
+	maxSize int
+	mu      sync.RWMutex
+	cache   map[string][]float32
+	keys    []string // insertion-order queue for FIFO eviction
+	sf      singleflight.Group
+	// backendTimeout bounds the singleflight backend call context.
+	backendTimeout time.Duration
+}
+
+// NewCachingEmbedder wraps inner with a bounded query-vector cache of
+// DefaultCacheSize entries.
+func NewCachingEmbedder(inner Embedder) *CachingEmbedder {
+	return NewCachingEmbedderSize(inner, DefaultCacheSize)
+}
+
+// NewCachingEmbedderSize wraps inner with a bounded query-vector cache of
+// maxSize entries. When the cache is full the oldest entry is evicted (FIFO).
+// maxSize <= 0 is replaced with DefaultCacheSize.
+func NewCachingEmbedderSize(inner Embedder, maxSize int) *CachingEmbedder {
+	if maxSize <= 0 {
+		maxSize = DefaultCacheSize
+	}
+	return &CachingEmbedder{
+		inner:          inner,
+		maxSize:        maxSize,
+		cache:          make(map[string][]float32, maxSize),
+		keys:           make([]string, 0, maxSize),
+		backendTimeout: defaultCacheMissEmbedTimeout,
+	}
+}
+
+func (c *CachingEmbedder) Model() string { return c.inner.Model() }
+func (c *CachingEmbedder) Dims() int     { return c.inner.Dims() }
+
+func cloneVec(vec []float32) []float32 {
+	if vec == nil {
+		return nil
+	}
+	out := make([]float32, len(vec))
+	copy(out, vec)
+	return out
+}
+
+// Embed returns a cached vector if available, otherwise calls the inner
+// embedder and stores the result. If the cache is at capacity the oldest
+// entry is evicted (FIFO) before the new entry is inserted.
+//
+// Concurrency: concurrent callers for the same text are coalesced via
+// singleflight — only one backend call is made per unique in-flight key.
+// The backend call is decoupled from any one caller's cancellation to avoid
+// leader-cancel fan-out, but is still bounded by backendTimeout so abandoned
+// requests cannot run indefinitely. Each caller waits on DoChan and may bail
+// early on its own ctx.Done().
+func (c *CachingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	// Fast path: read lock only.
+	c.mu.RLock()
+	if vec, ok := c.cache[text]; ok {
+		c.mu.RUnlock()
+		return cloneVec(vec), nil
+	}
+	c.mu.RUnlock()
+
+	// Slow path: coalesce concurrent misses via DoChan so each caller can
+	// independently respect its own ctx while the single backend call runs
+	// under a context that is not tied to any one caller.
+	ch := c.sf.DoChan(text, func() (any, error) {
+		// Re-check cache inside singleflight in case it was populated while
+		// we were waiting to enter the group.
+		c.mu.RLock()
+		if vec, ok := c.cache[text]; ok {
+			c.mu.RUnlock()
+			return cloneVec(vec), nil
+		}
+		c.mu.RUnlock()
+
+		// Decouple the backend call from any single caller, but bound total
+		// backend work duration so canceled/abandoned requests do not run
+		// indefinitely.
+		backendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.backendTimeout)
+		defer cancel()
+		vec, err := c.inner.Embed(backendCtx, text)
+		if err != nil {
+			return nil, err
+		}
+
+		c.mu.Lock()
+		if cached, ok := c.cache[text]; ok {
+			c.mu.Unlock()
+			return cached, nil
+		}
+		if len(c.cache) >= c.maxSize {
+			oldest := c.keys[0]
+			delete(c.cache, oldest)
+			// Keep queue capacity stable by shifting in-place, then writing
+			// the new key into the last slot.
+			copy(c.keys, c.keys[1:])
+			c.keys[len(c.keys)-1] = text
+		} else {
+			c.keys = append(c.keys, text)
+		}
+		c.cache[text] = cloneVec(vec)
+		c.mu.Unlock()
+
+		return vec, nil
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("embed: context done waiting for result: %w", ctx.Err())
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return cloneVec(res.Val.([]float32)), nil
+	}
+}
+
+// Len returns the number of entries currently in the cache.
+func (c *CachingEmbedder) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.cache)
+}
+
+// EmbedBatch delegates to the inner embedder's EmbedBatch when available,
+// preserving batch support for indexing paths. When the inner embedder does
+// not implement BatchEmbedder, it falls back to calling Embed per item so
+// that CachingEmbedder always satisfies the BatchEmbedder interface.
+//
+// Fallback error handling: individual item failures leave vecs[i] as nil and
+// are recorded; processing continues for the remaining items. To preserve
+// partial progress for batch callers, a partial-failure batch returns vecs with
+// a nil error. An error is returned only when every item in the batch fails.
+func (c *CachingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if batcher, ok := c.inner.(BatchEmbedder); ok {
+		return batcher.EmbedBatch(ctx, texts)
+	}
+	vecs := make([][]float32, len(texts))
+	var firstErr error
+	successes := 0
+	for i, text := range texts {
+		vec, err := c.Embed(ctx, text)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("embed batch: item %d: %w", i, err)
+			}
+			continue // leave vecs[i] nil; caller skips nil entries
+		}
+		vecs[i] = vec
+		successes++
+	}
+	if successes == 0 && firstErr != nil {
+		return vecs, firstErr
+	}
+	return vecs, nil
 }

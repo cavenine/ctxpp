@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -508,4 +510,492 @@ func TestDetect_BedrockCustomDims(t *testing.T) {
 		}
 	}
 	// If no credentials, falls back to bundled — that's fine for this test.
+}
+
+// ---- CachingEmbedder tests -------------------------------------------------
+
+// countingEmbedder records every text passed to Embed so tests can assert
+// how many (and which) calls reached the inner embedder.
+// It is safe for concurrent use.
+type countingEmbedder struct {
+	mu    sync.Mutex
+	calls []string
+	vec   []float32
+	err   error
+}
+
+func (c *countingEmbedder) Model() string { return "test" }
+func (c *countingEmbedder) Dims() int     { return len(c.vec) }
+func (c *countingEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
+	c.mu.Lock()
+	c.calls = append(c.calls, text)
+	c.mu.Unlock()
+	if c.err != nil {
+		return nil, c.err
+	}
+	return c.vec, nil
+}
+
+func (c *countingEmbedder) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.calls)
+}
+
+func TestCachingEmbedder_CachesOnSecondCall(t *testing.T) {
+	inner := &countingEmbedder{vec: []float32{1, 2, 3}}
+	c := NewCachingEmbedder(inner)
+
+	v1, err := c.Embed(t.Context(), "hello")
+	if err != nil {
+		t.Fatalf("first Embed() error = %v", err)
+	}
+	v2, err := c.Embed(t.Context(), "hello")
+	if err != nil {
+		t.Fatalf("second Embed() error = %v", err)
+	}
+
+	if inner.callCount() != 1 {
+		t.Errorf("inner called %d times, want 1", inner.callCount())
+	}
+	if len(v1) != len(v2) {
+		t.Errorf("vectors differ in length: %d vs %d", len(v1), len(v2))
+	}
+}
+
+func TestCachingEmbedder_DifferentTextsCallInner(t *testing.T) {
+	inner := &countingEmbedder{vec: []float32{0.5}}
+	c := NewCachingEmbedder(inner)
+
+	texts := []string{"alpha", "beta", "gamma"}
+	for _, txt := range texts {
+		if _, err := c.Embed(t.Context(), txt); err != nil {
+			t.Fatalf("Embed(%q) error = %v", txt, err)
+		}
+	}
+
+	if got := inner.callCount(); got != len(texts) {
+		t.Errorf("inner called %d times, want %d", got, len(texts))
+	}
+	if got := c.Len(); got != len(texts) {
+		t.Errorf("Len() = %d, want %d", got, len(texts))
+	}
+}
+
+func TestCachingEmbedder_ErrorNotCached(t *testing.T) {
+	inner := &countingEmbedder{err: errors.New("backend down")}
+	c := NewCachingEmbedder(inner)
+
+	_, err := c.Embed(t.Context(), "query")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	// After an error the cache should still be empty.
+	if got := c.Len(); got != 0 {
+		t.Errorf("Len() = %d after error, want 0", got)
+	}
+
+	// Second call should hit inner again (not serve a cached error).
+	_, _ = c.Embed(t.Context(), "query")
+	if got := inner.callCount(); got != 2 {
+		t.Errorf("inner called %d times after two failures, want 2", got)
+	}
+}
+
+func TestCachingEmbedder_DelegatesModelAndDims(t *testing.T) {
+	inner := &countingEmbedder{vec: make([]float32, 7)}
+	c := NewCachingEmbedder(inner)
+	if c.Model() != "test" {
+		t.Errorf("Model() = %q, want %q", c.Model(), "test")
+	}
+	if c.Dims() != 7 {
+		t.Errorf("Dims() = %d, want 7", c.Dims())
+	}
+}
+
+func TestCachingEmbedder_ConcurrentSafeHits(t *testing.T) {
+	inner := &countingEmbedder{vec: []float32{1}}
+	c := NewCachingEmbedder(inner)
+
+	// Pre-populate the cache.
+	if _, err := c.Embed(t.Context(), "shared"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hammer the cache from multiple goroutines; all should hit the cache
+	// and the inner embedder should still only have been called once.
+	const goroutines = 50
+	errs := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			_, err := c.Embed(t.Context(), "shared")
+			errs <- err
+		}()
+	}
+	for i := 0; i < goroutines; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent Embed() error = %v", err)
+		}
+	}
+
+	if got := inner.callCount(); got != 1 {
+		t.Errorf("inner called %d times under concurrency, want 1", got)
+	}
+}
+
+func TestCachingEmbedder_EvictsOldestWhenFull(t *testing.T) {
+	inner := &countingEmbedder{vec: []float32{1}}
+	const maxSize = 3
+	c := NewCachingEmbedderSize(inner, maxSize)
+
+	// Fill the cache: query-0, query-1, query-2 (query-0 is oldest).
+	for i := 0; i < maxSize; i++ {
+		if _, err := c.Embed(t.Context(), fmt.Sprintf("query-%d", i)); err != nil {
+			t.Fatalf("Embed() error = %v", err)
+		}
+	}
+	if got := c.Len(); got != maxSize {
+		t.Fatalf("Len() = %d, want %d after fill", got, maxSize)
+	}
+
+	// Adding a new entry evicts query-0 (oldest); cache stays at maxSize.
+	if _, err := c.Embed(t.Context(), "new"); err != nil {
+		t.Fatalf("Embed() error = %v", err)
+	}
+	if got := c.Len(); got != maxSize {
+		t.Errorf("Len() = %d, want %d after eviction", got, maxSize)
+	}
+
+	// query-0 was evicted — it must reach the inner embedder again.
+	callsBefore := inner.callCount()
+	if _, err := c.Embed(t.Context(), "query-0"); err != nil {
+		t.Fatalf("Embed() error = %v", err)
+	}
+	if got := inner.callCount(); got != callsBefore+1 {
+		t.Errorf("evicted key re-embedded %d extra times, want 1", got-callsBefore)
+	}
+	// Re-embedding query-0 evicts the next oldest (query-1).
+	// Cache is now: query-2, new, query-0.
+
+	// query-2 and "new" are still cached — must not hit inner.
+	callsBefore = inner.callCount()
+	for _, q := range []string{"query-2", "new"} {
+		if _, err := c.Embed(t.Context(), q); err != nil {
+			t.Fatalf("Embed(%q) error = %v", q, err)
+		}
+	}
+	if got := inner.callCount(); got != callsBefore {
+		t.Errorf("non-evicted keys hit inner %d extra times, want 0", got-callsBefore)
+	}
+}
+
+func TestCachingEmbedder_ZeroMaxSizeUsesDefault(t *testing.T) {
+	inner := &countingEmbedder{vec: []float32{1}}
+	c := NewCachingEmbedderSize(inner, 0)
+	if c.maxSize != DefaultCacheSize {
+		t.Errorf("maxSize = %d, want DefaultCacheSize (%d)", c.maxSize, DefaultCacheSize)
+	}
+}
+
+func TestCachingEmbedder_ConcurrentSafeMissesSameKey(t *testing.T) {
+	inner := &countingEmbedder{vec: []float32{1}}
+	c := NewCachingEmbedder(inner)
+
+	// Hammer the cache from a cold start with the same key. After all
+	// goroutines finish, keys and cache must be consistent: exactly one entry,
+	// with no duplicate keys in the FIFO queue.
+	const goroutines = 50
+	errs := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			_, err := c.Embed(t.Context(), "shared-miss")
+			errs <- err
+		}()
+	}
+	for i := 0; i < goroutines; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent Embed() error = %v", err)
+		}
+	}
+
+	// Cache must contain exactly one entry for "shared-miss".
+	if got := c.Len(); got != 1 {
+		t.Errorf("Len() = %d after concurrent misses, want 1", got)
+	}
+	// The FIFO keys queue must not contain duplicates.
+	c.mu.RLock()
+	keyCount := len(c.keys)
+	c.mu.RUnlock()
+	if keyCount != 1 {
+		t.Errorf("keys queue len = %d, want 1 (duplicate inserts detected)", keyCount)
+	}
+	// Concurrent misses for the same key must be coalesced into a single
+	// backend call — the inner embedder must be called exactly once.
+	if got := inner.callCount(); got != 1 {
+		t.Errorf("inner.callCount() = %d, want 1 backend call for concurrent misses to the same key", got)
+	}
+}
+
+// batchCountingEmbedder is a BatchEmbedder test double that records calls.
+type batchCountingEmbedder struct {
+	countingEmbedder
+	batchCalls [][]string
+	batchMu    sync.Mutex
+}
+
+func (b *batchCountingEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
+	b.batchMu.Lock()
+	b.batchCalls = append(b.batchCalls, texts)
+	b.batchMu.Unlock()
+	vecs := make([][]float32, len(texts))
+	for i := range texts {
+		vecs[i] = b.vec
+	}
+	return vecs, nil
+}
+
+func (b *batchCountingEmbedder) batchCallCount() int {
+	b.batchMu.Lock()
+	defer b.batchMu.Unlock()
+	return len(b.batchCalls)
+}
+
+// Compile-time assertion: CachingEmbedder must satisfy BatchEmbedder.
+var _ BatchEmbedder = (*CachingEmbedder)(nil)
+
+// TestCachingEmbedder_EmbedBatchDelegatesToInner verifies that when the inner
+// embedder implements BatchEmbedder, CachingEmbedder delegates EmbedBatch
+// directly to it.
+func TestCachingEmbedder_EmbedBatchDelegatesToInner(t *testing.T) {
+	inner := &batchCountingEmbedder{countingEmbedder: countingEmbedder{vec: []float32{1, 2}}}
+	c := NewCachingEmbedder(inner)
+
+	texts := []string{"a", "b", "c"}
+	vecs, err := c.EmbedBatch(t.Context(), texts)
+	if err != nil {
+		t.Fatalf("EmbedBatch() error = %v", err)
+	}
+	if len(vecs) != len(texts) {
+		t.Errorf("EmbedBatch() returned %d vecs, want %d", len(vecs), len(texts))
+	}
+	if got := inner.batchCallCount(); got != 1 {
+		t.Errorf("inner.EmbedBatch called %d times, want 1", got)
+	}
+	// EmbedBatch must NOT have called Embed on the inner.
+	if got := inner.callCount(); got != 0 {
+		t.Errorf("inner.Embed called %d times during EmbedBatch, want 0", got)
+	}
+}
+
+// TestCachingEmbedder_EmbedBatchFallsBackToEmbed verifies that when the inner
+// embedder does NOT implement BatchEmbedder, CachingEmbedder falls back to
+// calling Embed per item.
+func TestCachingEmbedder_EmbedBatchFallsBackToEmbed(t *testing.T) {
+	inner := &countingEmbedder{vec: []float32{0.5}}
+	c := NewCachingEmbedder(inner)
+
+	texts := []string{"x", "y", "z"}
+	vecs, err := c.EmbedBatch(t.Context(), texts)
+	if err != nil {
+		t.Fatalf("EmbedBatch() fallback error = %v", err)
+	}
+	if len(vecs) != len(texts) {
+		t.Errorf("EmbedBatch() fallback returned %d vecs, want %d", len(vecs), len(texts))
+	}
+	if got := inner.callCount(); got != len(texts) {
+		t.Errorf("inner.Embed called %d times, want %d", got, len(texts))
+	}
+}
+
+// TestCachingEmbedder_EmbedBatchFallbackPartialSuccess verifies that when the
+// fallback path (no inner BatchEmbedder) encounters a per-item error, it:
+//   - continues processing remaining items rather than aborting,
+//   - returns nil vectors for failed items and real vectors for successes,
+//   - returns nil error to preserve partial progress for callers.
+func TestCachingEmbedder_EmbedBatchFallbackPartialSuccess(t *testing.T) {
+	failErr := errors.New("backend down")
+	callN := 0
+	// failOnSecond fails only the second call.
+	inner := &funcEmbedder{
+		model: "test",
+		dims:  1,
+		embedFn: func(_ context.Context, _ string) ([]float32, error) {
+			callN++
+			if callN == 2 {
+				return nil, failErr
+			}
+			return []float32{float32(callN)}, nil
+		},
+	}
+	c := NewCachingEmbedder(inner)
+
+	texts := []string{"a", "b", "c"}
+	vecs, err := c.EmbedBatch(t.Context(), texts)
+
+	// Partial success must return nil error so callers can keep successful vecs.
+	if err != nil {
+		t.Fatalf("EmbedBatch() fallback: partial failure error = %v, want nil", err)
+	}
+	// Must still return a slice of the correct length.
+	if len(vecs) != len(texts) {
+		t.Fatalf("EmbedBatch() fallback returned %d vecs, want %d", len(vecs), len(texts))
+	}
+	// Items 0 and 2 succeeded — must be non-nil.
+	if vecs[0] == nil {
+		t.Error("vecs[0] is nil, want non-nil (successful item)")
+	}
+	if vecs[2] == nil {
+		t.Error("vecs[2] is nil, want non-nil (successful item)")
+	}
+	// Item 1 failed — must be nil.
+	if vecs[1] != nil {
+		t.Error("vecs[1] is non-nil, want nil (failed item)")
+	}
+}
+
+func TestCachingEmbedder_EmbedBatchFallbackAllFailReturnsError(t *testing.T) {
+	failErr := errors.New("backend down")
+	inner := &funcEmbedder{
+		model: "test",
+		dims:  1,
+		embedFn: func(_ context.Context, _ string) ([]float32, error) {
+			return nil, failErr
+		},
+	}
+	c := NewCachingEmbedder(inner)
+
+	vecs, err := c.EmbedBatch(t.Context(), []string{"a", "b", "c"})
+	if err == nil {
+		t.Fatal("EmbedBatch() fallback all-fail error = nil, want non-nil")
+	}
+	if !errors.Is(err, failErr) {
+		t.Errorf("EmbedBatch() error = %v, want wrapped %v", err, failErr)
+	}
+	if len(vecs) != 3 {
+		t.Fatalf("EmbedBatch() returned %d vecs, want 3", len(vecs))
+	}
+	for i := range vecs {
+		if vecs[i] != nil {
+			t.Errorf("vecs[%d] is non-nil, want nil", i)
+		}
+	}
+}
+
+func TestCachingEmbedder_EmbedReturnsDefensiveCopy(t *testing.T) {
+	inner := &countingEmbedder{vec: []float32{1, 2, 3}}
+	c := NewCachingEmbedder(inner)
+
+	first, err := c.Embed(t.Context(), "copy-key")
+	if err != nil {
+		t.Fatalf("Embed() first error = %v", err)
+	}
+	first[0] = 999
+
+	second, err := c.Embed(t.Context(), "copy-key")
+	if err != nil {
+		t.Fatalf("Embed() second error = %v", err)
+	}
+	if second[0] == 999 {
+		t.Fatal("cached vector was externally mutated; expected defensive copy")
+	}
+}
+
+// TestCachingEmbedder_EmbedCanceledLeaderDoesNotFailWaiters verifies that
+// when a singleflight leader's context is cancelled, other concurrent waiters
+// with valid contexts still receive a result (they do not inherit the leader's
+// cancellation).
+func TestCachingEmbedder_EmbedCanceledLeaderDoesNotFailWaiters(t *testing.T) {
+	// Slow embedder that blocks until released.
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	inner := &funcEmbedder{
+		model: "test",
+		dims:  1,
+		embedFn: func(ctx context.Context, _ string) ([]float32, error) {
+			startedOnce.Do(func() { close(started) })
+			select {
+			case <-release:
+				return []float32{1}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	c := NewCachingEmbedder(inner)
+
+	// Leader goroutine: cancellable context.
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := c.Embed(leaderCtx, "key")
+		leaderDone <- err
+	}()
+
+	// Wait deterministically until the backend call is in flight.
+	<-started
+
+	// Waiter goroutine: long-lived context — must not be affected by leader cancel.
+	waiterDone := make(chan error, 1)
+	waiterStarted := make(chan struct{})
+	go func() {
+		close(waiterStarted)
+		_, err := c.Embed(context.Background(), "key")
+		waiterDone <- err
+	}()
+	<-waiterStarted
+
+	// Cancel the leader.
+	leaderCancel()
+
+	// Allow backend to complete so waiter can succeed.
+	close(release)
+
+	if err := <-waiterDone; err != nil {
+		t.Errorf("waiter Embed() error = %v, want nil (canceled leader must not fail waiter)", err)
+	}
+	// Leader itself may or may not error depending on timing; we don't assert it.
+	select {
+	case <-leaderDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("leader goroutine did not return")
+	}
+}
+
+func TestCachingEmbedder_EmbedBackendTimeoutIsBounded(t *testing.T) {
+	inner := &funcEmbedder{
+		model: "test",
+		dims:  1,
+		embedFn: func(ctx context.Context, _ string) ([]float32, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	c := NewCachingEmbedder(inner)
+	c.backendTimeout = 20 * time.Millisecond
+
+	start := time.Now()
+	_, err := c.Embed(context.Background(), "timeout-key")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Embed() error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Errorf("Embed() elapsed = %v, want <= 250ms", elapsed)
+	}
+}
+
+// funcEmbedder is a test double whose Embed behaviour is provided via a closure.
+type funcEmbedder struct {
+	model   string
+	dims    int
+	embedFn func(ctx context.Context, text string) ([]float32, error)
+}
+
+func (f *funcEmbedder) Model() string { return f.model }
+func (f *funcEmbedder) Dims() int     { return f.dims }
+func (f *funcEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	return f.embedFn(ctx, text)
 }

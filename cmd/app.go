@@ -13,10 +13,11 @@ import (
 
 // app holds shared dependencies for MCP handlers.
 type app struct {
-	store    *store.Store
-	indexer  *indexer.Indexer
-	embedder embed.Embedder
-	root     string
+	store         *store.Store
+	indexer       *indexer.Indexer
+	indexEmbedder embed.Embedder // used by indexing paths (uncached, preserves BatchEmbedder)
+	queryEmbedder embed.Embedder // used by search handlers (CachingEmbedder-wrapped)
+	root          string
 }
 
 // allParsers returns the full set of language parsers ctx++ supports.

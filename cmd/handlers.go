@@ -19,8 +19,10 @@ func (a *app) handleIndex(_ context.Context, req mcp.CallToolRequest) (*mcp.Call
 
 	ctx := context.Background()
 	// Re-create indexer with potentially different root.
+	// Use indexEmbedder (uncached) so indexing batches do not pollute or
+	// evict the query-time cache held by queryEmbedder.
 	idx := indexer.New(indexer.Config{ProjectRoot: root}, a.store,
-		allParsers(), a.embedder)
+		allParsers(), a.indexEmbedder)
 
 	stats, err := idx.Index(ctx)
 	if err != nil {
@@ -50,14 +52,20 @@ func (a *app) handleSearch(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	case "keyword":
 		syms, err = a.store.SearchKeyword(query, limit)
 	case "semantic":
-		vec, eerr := a.embedder.Embed(ctx, query)
+		vec, eerr := a.queryEmbedder.Embed(ctx, query)
 		if eerr != nil {
 			return mcp.NewToolResultText(fmt.Sprintf("embed error: %v", eerr)), nil
 		}
 		syms, err = a.store.SearchSemantic(vec, limit)
 	default: // hybrid
-		vec, _ := a.embedder.Embed(ctx, query)
-		syms, err = a.store.SearchHybrid(vec, query, limit)
+		vec, eerr := a.queryEmbedder.Embed(ctx, query)
+		if eerr != nil {
+			// On embed failures in hybrid mode, fall back to keyword-only search
+			// instead of running a semantic scan with an invalid vector.
+			syms, err = a.store.SearchKeyword(query, limit)
+		} else {
+			syms, err = a.store.SearchHybrid(vec, query, limit)
+		}
 	}
 
 	if err != nil {

@@ -415,9 +415,10 @@ func (idx *Indexer) Index(ctx context.Context) (IndexStats, error) {
 				}
 				vecs, err := batcher.EmbedBatch(ctx, texts)
 				if err != nil {
-					idx.log.Warn("embed batch failed", "size", len(jobs), "err", err)
-					return
+					idx.log.Warn("embed batch error; retrying failed items individually", "size", len(jobs), "err", err)
 				}
+
+				failed := make([]embedJob, 0, len(jobs))
 				for i, ej := range jobs {
 					if i < len(vecs) && vecs[i] != nil {
 						select {
@@ -425,6 +426,31 @@ func (idx *Indexer) Index(ctx context.Context) (IndexStats, error) {
 						case <-ctx.Done():
 							return
 						}
+						continue
+					}
+					failed = append(failed, ej)
+				}
+
+				if len(failed) == 0 {
+					return
+				}
+
+				// Self-heal path: retry failed batch items individually so a single
+				// batch error does not discard successful work for the entire batch.
+				idx.log.Warn("embed batch partial failure", "failed", len(failed), "size", len(jobs))
+				for _, ej := range failed {
+					if ctx.Err() != nil {
+						return
+					}
+					vec, eerr := idx.embedder.Embed(ctx, ej.text)
+					if eerr != nil {
+						idx.log.Warn("embed retry failed", "symbol", ej.symbolID, "err", eerr)
+						continue
+					}
+					select {
+					case embedResults <- embedResult{symbolID: ej.symbolID, vec: vec}:
+					case <-ctx.Done():
+						return
 					}
 				}
 			}()

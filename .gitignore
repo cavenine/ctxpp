@@ -14,8 +14,9 @@ bench/results/
 *.out
 coverage.html
 
-# Local opencode config (machine-specific paths)
+# Local opencode config and skills (machine-specific)
 opencode.jsonc
+.opencode/
 
 # IDE / editor
 .idea/
