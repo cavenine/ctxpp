@@ -695,6 +695,10 @@ func (idx *Indexer) Watch(ctx context.Context) error {
 	}
 }
 
+// addWatchDirsRecursive walks a newly created directory tree and adds all
+// eligible directories to fsnotify. It also indexes supported files already
+// present in that tree so pre-populated creates (e.g. rename/extract) are
+// visible immediately without waiting for another event.
 func (idx *Indexer) addWatchDirsRecursive(ctx context.Context, watcher *fsnotify.Watcher, root string, gi *gitignore.GitIgnore) {
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -740,6 +744,9 @@ func (idx *Indexer) addWatchDirsRecursive(ctx context.Context, watcher *fsnotify
 	})
 }
 
+// shouldSkipWatchDir reports whether a directory should be excluded from watch
+// registration and reconcile walks using the same hidden/node_modules/
+// .gitignore policy as indexing.
 func (idx *Indexer) shouldSkipWatchDir(path, base string, gi *gitignore.GitIgnore) bool {
 	if base != "." && (strings.HasPrefix(base, ".") || base == "node_modules") {
 		return true
@@ -751,15 +758,15 @@ func (idx *Indexer) shouldSkipWatchDir(path, base string, gi *gitignore.GitIgnor
 	if rel == "." {
 		return false
 	}
-	if rel == ".ctxpp" || strings.HasPrefix(rel, ".ctxpp/") {
-		return true
-	}
 	if gi != nil && gi.MatchesPath(rel) {
 		return true
 	}
 	return false
 }
 
+// reconcileStartup catches up filesystem changes missed while watcher was not
+// running: it indexes supported files currently on disk and removes stale file
+// rows for indexed paths that no longer exist.
 func (idx *Indexer) reconcileStartup(ctx context.Context, gi *gitignore.GitIgnore) {
 	seen := make(map[string]struct{})
 
