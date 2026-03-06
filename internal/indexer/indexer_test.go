@@ -1029,6 +1029,51 @@ func NewDirFunc() {}
 	}
 }
 
+func TestWatch_IndexesExistingFilesInNewlyCreatedDirectoryTree(t *testing.T) {
+	root := t.TempDir()
+	st := openTestStore(t)
+	idx := newTestIndexer(t, root, st)
+	idx.cfg.WatchDebounce = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	watchErr := make(chan error, 1)
+	go func() {
+		watchErr <- idx.Watch(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	srcParent := t.TempDir()
+	srcTree := filepath.Join(srcParent, "imported")
+	if err := os.MkdirAll(filepath.Join(srcTree, "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	writeFile(t, filepath.Join(srcTree, "nested"), "existing.go", `package nested
+
+func Existing() {}
+`)
+
+	dstTree := filepath.Join(root, "imported")
+	if err := os.Rename(srcTree, dstTree); err != nil {
+		t.Fatalf("Rename() error = %v", err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		syms, err := st.GetSymbolsByFile("imported/nested/existing.go")
+		if err != nil {
+			t.Fatalf("GetSymbolsByFile() error = %v", err)
+		}
+		return len(syms) > 0
+	})
+
+	cancel()
+	if err := <-watchErr; err != nil {
+		t.Errorf("Watch() error = %v", err)
+	}
+}
+
 func TestWatch_ReconcilesFileCreatedWhileOfflineOnStartup(t *testing.T) {
 	root := t.TempDir()
 	st := openTestStore(t)

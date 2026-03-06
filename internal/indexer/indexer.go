@@ -664,7 +664,7 @@ func (idx *Indexer) Watch(ctx context.Context) error {
 			if event.Has(fsnotify.Create) {
 				info, err := os.Stat(event.Name)
 				if err == nil && info.IsDir() {
-					idx.addWatchDirsRecursive(watcher, event.Name, gi)
+					idx.addWatchDirsRecursive(ctx, watcher, event.Name, gi)
 					continue
 				}
 				if err != nil && !os.IsNotExist(err) {
@@ -695,7 +695,7 @@ func (idx *Indexer) Watch(ctx context.Context) error {
 	}
 }
 
-func (idx *Indexer) addWatchDirsRecursive(watcher *fsnotify.Watcher, root string, gi *gitignore.GitIgnore) {
+func (idx *Indexer) addWatchDirsRecursive(ctx context.Context, watcher *fsnotify.Watcher, root string, gi *gitignore.GitIgnore) {
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -704,17 +704,37 @@ func (idx *Indexer) addWatchDirsRecursive(watcher *fsnotify.Watcher, root string
 			idx.log.Warn("watch walk new dir", "path", path, "err", err)
 			return nil
 		}
-		if !d.IsDir() {
+		if d.IsDir() {
+			if idx.shouldSkipWatchDir(path, d.Name(), gi) {
+				return filepath.SkipDir
+			}
+			if err := watcher.Add(path); err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				idx.log.Warn("watch add dir", "path", path, "err", err)
+			}
 			return nil
 		}
-		if idx.shouldSkipWatchDir(path, d.Name(), gi) {
-			return filepath.SkipDir
+		rel, err := filepath.Rel(idx.cfg.ProjectRoot, path)
+		if err != nil {
+			idx.log.Warn("watch rel file", "path", path, "err", err)
+			return nil
 		}
-		if err := watcher.Add(path); err != nil {
+		if gi != nil && gi.MatchesPath(rel) {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if _, ok := idx.parsers[ext]; !ok {
+			if _, ok := idx.filenames[filepath.Base(path)]; !ok {
+				return nil
+			}
+		}
+		if _, _, err := idx.indexFile(ctx, path, rel, ext); err != nil {
 			if os.IsNotExist(err) {
 				return nil
 			}
-			idx.log.Warn("watch add dir", "path", path, "err", err)
+			idx.log.Warn("watch index existing file", "path", rel, "err", err)
 		}
 		return nil
 	})
