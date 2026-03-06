@@ -78,7 +78,7 @@ func runBackfill(path string) {
 
 	embedder, active := embed.Detect(ctx)
 	if !active {
-		fmt.Fprintln(os.Stderr, "WARNING: No embedding backend detected. Set CTXPP_EMBED_BACKEND=bedrock or start Ollama before running backfill.")
+		fmt.Fprintln(os.Stderr, "WARNING: No embedding backend detected. Set CTXPP_EMBED_BACKEND=openai, set CTXPP_EMBED_BACKEND=bedrock, or start Ollama before running backfill.")
 		fmt.Fprintln(os.Stderr, "         Backfill will store zero vectors (stub embedder).")
 	} else {
 		fmt.Printf("embedder: %s (%d dims)\n", embedder.Model(), embedder.Dims())
