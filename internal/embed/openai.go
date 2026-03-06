@@ -12,6 +12,7 @@ import (
 )
 
 const defaultOpenAIURL = "https://api.openai.com"
+const maxOpenAIErrorBodyBytes = 4096
 
 type openAIEmbedRequest struct {
 	Model string   `json:"model"`
@@ -106,6 +107,13 @@ func (e *OpenAIEmbedder) Ping(ctx context.Context) error {
 }
 
 func (e *OpenAIEmbedder) doEmbed(ctx context.Context, texts []string) ([][]float32, error) {
+	if e.model == "" {
+		return nil, fmt.Errorf("openai embed: model is required")
+	}
+	if e.dims <= 0 {
+		return nil, fmt.Errorf("openai embed: dims must be > 0")
+	}
+
 	body, err := json.Marshal(openAIEmbedRequest{Model: e.model, Input: texts})
 	if err != nil {
 		return nil, fmt.Errorf("openai embed: marshal: %w", err)
@@ -137,12 +145,15 @@ func (e *OpenAIEmbedder) doEmbed(ctx context.Context, texts []string) ([][]float
 	if len(result.Data) == 0 {
 		return nil, fmt.Errorf("openai embed: empty response")
 	}
+	if len(result.Data) != len(texts) {
+		return nil, fmt.Errorf("openai embed: got %d embeddings for %d inputs", len(result.Data), len(texts))
+	}
 
-	vecs := make([][]float32, len(result.Data))
-	seen := make([]bool, len(result.Data))
+	vecs := make([][]float32, len(texts))
+	seen := make([]bool, len(texts))
 	for _, item := range result.Data {
-		if item.Index < 0 || item.Index >= len(result.Data) {
-			return nil, fmt.Errorf("openai embed: response index %d out of range for %d embeddings", item.Index, len(result.Data))
+		if item.Index < 0 || item.Index >= len(texts) {
+			return nil, fmt.Errorf("openai embed: response index %d out of range for %d inputs", item.Index, len(texts))
 		}
 		if seen[item.Index] {
 			return nil, fmt.Errorf("openai embed: duplicate response index %d", item.Index)
@@ -161,24 +172,32 @@ func (e *OpenAIEmbedder) doEmbed(ctx context.Context, texts []string) ([][]float
 			return nil, fmt.Errorf("openai embed: missing embedding for response index %d", i)
 		}
 	}
-	if len(vecs) != len(texts) {
-		return nil, fmt.Errorf("openai embed: got %d embeddings for %d inputs", len(vecs), len(texts))
-	}
 	return vecs, nil
 }
 
 func (e *OpenAIEmbedder) httpError(resp *http.Response) error {
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOpenAIErrorBodyBytes+1))
 	if err != nil {
 		return fmt.Errorf("openai embed: status %d", resp.StatusCode)
 	}
+	truncated := len(body) > maxOpenAIErrorBodyBytes
+	if truncated {
+		body = body[:maxOpenAIErrorBodyBytes]
+	}
 	var apiErr openAIErrorResponse
 	if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.Error != nil && apiErr.Error.Message != "" {
-		return fmt.Errorf("openai embed: status %d: %s", resp.StatusCode, apiErr.Error.Message)
+		msg := apiErr.Error.Message
+		if truncated {
+			msg += "..."
+		}
+		return fmt.Errorf("openai embed: status %d: %s", resp.StatusCode, msg)
 	}
 	msg := strings.TrimSpace(string(body))
 	if msg == "" {
 		return fmt.Errorf("openai embed: status %d", resp.StatusCode)
+	}
+	if truncated {
+		msg += "..."
 	}
 	return fmt.Errorf("openai embed: status %d: %s", resp.StatusCode, msg)
 }

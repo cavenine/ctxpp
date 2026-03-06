@@ -82,7 +82,7 @@ func runMCP() {
 	if usingOllama {
 		slog.Info("embedder: active", "model", baseEmbedder.Model())
 	} else {
-		slog.Warn("No embedding backend detected -- semantic search disabled. Install Ollama (https://ollama.com) and run 'ollama pull bge-m3', or set CTXPP_EMBED_BACKEND=openai or CTXPP_EMBED_BACKEND=bedrock.")
+		slog.Warn("No embedding backend detected -- semantic search disabled. Install Ollama (https://ollama.com) and run 'ollama pull bge-m3', or configure OpenAI/Bedrock: set CTXPP_EMBED_BACKEND=openai with CTXPP_OPENAI_MODEL and CTXPP_OPENAI_DIMS, or set CTXPP_EMBED_BACKEND=bedrock. See README for details.")
 	}
 
 	parsers := allParsers()

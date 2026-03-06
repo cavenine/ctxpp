@@ -357,7 +357,7 @@ All configuration is via environment variables.
 | `CTXPP_PROJECT` | `.` | Path to the project root to index |
 | `CTXPP_OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
 | `CTXPP_OLLAMA_MODEL` | `bge-m3` | Ollama embedding model |
-| `CTXPP_EMBED_BACKEND` | _(auto-detect)_ | Embedding backend: `ollama`, `openai`, or `bedrock` |
+| `CTXPP_EMBED_BACKEND` | _(auto-detect)_ | Embedding backend: `auto`, `ollama`, `tei`, `openai`, `bedrock`, or `bundled` |
 | `CTXPP_OPENAI_URL` | `https://api.openai.com` | OpenAI-compatible embeddings API base URL |
 | `CTXPP_OPENAI_MODEL` | _(required with `openai`)_ | OpenAI-compatible embedding model |
 | `CTXPP_OPENAI_API_KEY` | _(optional)_ | Bearer token for OpenAI-compatible providers |

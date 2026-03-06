@@ -388,7 +388,7 @@ func (r *RetryingEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]
 //
 //	CTXPP_EMBED_BACKEND    "auto" (default), "ollama", "tei", "bedrock", "openai", or "bundled"
 //	CTXPP_OLLAMA_URL       Ollama base URL (default http://localhost:11434)
-//	CTXPP_OLLAMA_MODEL     Ollama model name (default all-minilm)
+//	CTXPP_OLLAMA_MODEL     Ollama model name (default bge-m3)
 //	CTXPP_OLLAMA_SOCKET    Unix domain socket path (optional; bypasses TCP)
 //	CTXPP_TEI_URL          TEI base URL (default http://localhost:8080)
 //	CTXPP_TEI_MODEL        TEI model identifier (default sentence-transformers/all-MiniLM-L6-v2)

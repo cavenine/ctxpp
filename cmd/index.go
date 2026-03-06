@@ -76,7 +76,8 @@ func runIndex(path string, force bool) {
 	} else {
 		fmt.Fprintln(os.Stderr, "WARNING: No embedding backend detected -- indexing with keyword search only.")
 		fmt.Fprintln(os.Stderr, "         Install Ollama (https://ollama.com) and run 'ollama pull bge-m3',")
-		fmt.Fprintln(os.Stderr, "         or set CTXPP_EMBED_BACKEND=openai or CTXPP_EMBED_BACKEND=bedrock.")
+		fmt.Fprintln(os.Stderr, "         or set CTXPP_EMBED_BACKEND=openai with CTXPP_OPENAI_MODEL/CTXPP_OPENAI_DIMS,")
+		fmt.Fprintln(os.Stderr, "         or set CTXPP_EMBED_BACKEND=bedrock. See README for details.")
 	}
 
 	idx := indexer.New(indexer.Config{ProjectRoot: root, Force: force}, st, allParsers(), embedder)

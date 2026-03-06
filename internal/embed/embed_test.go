@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -570,6 +571,121 @@ func TestOpenAIEmbedder_EmbedBatch_ReordersByIndex(t *testing.T) {
 	}
 	if got := vecs[1][0]; got != 1 {
 		t.Errorf("vecs[1][0] = %v, want 1", got)
+	}
+}
+
+func TestOpenAIEmbedder_Embed_InvalidJSON(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("not json"))
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want decode error")
+	}
+}
+
+func TestOpenAIEmbedder_Embed_EmptyData(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{Data: []openAIEmbedData{}})
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want empty response error")
+	}
+}
+
+func TestOpenAIEmbedder_EmbedBatch_CountMismatch(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}}},
+		})
+	})
+
+	_, err := e.EmbedBatch(context.Background(), []string{"first", "second"})
+	if err == nil {
+		t.Fatal("EmbedBatch() error = nil, want count mismatch error")
+	}
+}
+
+func TestOpenAIEmbedder_Embed_DimsMismatch(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{{Index: 0, Embedding: []float32{0.1, 0.2}}},
+		})
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want dims mismatch error")
+	}
+}
+
+func TestOpenAIEmbedder_EmbedBatch_DuplicateIndex(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{
+				{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}},
+				{Index: 0, Embedding: []float32{0.4, 0.5, 0.6}},
+			},
+		})
+	})
+
+	_, err := e.EmbedBatch(context.Background(), []string{"first", "second"})
+	if err == nil {
+		t.Fatal("EmbedBatch() error = nil, want duplicate index error")
+	}
+}
+
+func TestOpenAIEmbedder_EmbedBatch_MissingIndex(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIEmbedResponse{
+			Data: []openAIEmbedData{
+				{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}},
+				{Index: 2, Embedding: []float32{0.4, 0.5, 0.6}},
+			},
+		})
+	})
+
+	_, err := e.EmbedBatch(context.Background(), []string{"first", "second"})
+	if err == nil {
+		t.Fatal("EmbedBatch() error = nil, want missing index error")
+	}
+}
+
+func TestOpenAIEmbedder_Embed_ServerErrorIncludesAPIMessage(t *testing.T) {
+	_, e := newTestOpenAIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(openAIErrorResponse{Error: &struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+		}{Message: "rate limit"}})
+	})
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want HTTP error")
+	}
+	if got := err.Error(); !strings.Contains(got, "rate limit") {
+		t.Fatalf("Embed() error = %q, want API message", got)
+	}
+}
+
+func TestOpenAIEmbedder_Embed_InvalidConfiguration(t *testing.T) {
+	e := NewOpenAIEmbedder("https://example.com", "", "", 0)
+
+	_, err := e.Embed(context.Background(), "hello world")
+	if err == nil {
+		t.Fatal("Embed() error = nil, want configuration error")
 	}
 }
 
