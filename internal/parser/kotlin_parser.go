@@ -146,8 +146,9 @@ func kotlinExtractFunction(n *sitter.Node, src []byte, filePath, packageName, en
 	if idx := strings.Index(sig, "{"); idx >= 0 {
 		sig = strings.TrimSpace(sig[:idx])
 	}
+	idName := qualifiedMemberName(enclosingType, name)
 	return &types.Symbol{
-		ID:         symbolID(filePath, name, kind),
+		ID:         symbolID(filePath, idName, kind),
 		File:       filePath,
 		Name:       name,
 		Kind:       kind,
@@ -178,7 +179,7 @@ func kotlinExtractProperties(n *sitter.Node, src []byte, filePath, packageName, 
 				kind = types.KindField
 			}
 			out = append(out, types.Symbol{
-				ID:        symbolID(filePath, nodeText(decl, src), kind),
+				ID:        symbolID(filePath, qualifiedMemberName(enclosingType, nodeText(decl, src)), kind),
 				File:      filePath,
 				Name:      nodeText(decl, src),
 				Kind:      kind,
@@ -245,4 +246,11 @@ func hasChildType(n *sitter.Node, want string) bool {
 		}
 	}
 	return false
+}
+
+func qualifiedMemberName(receiver, name string) string {
+	if receiver == "" {
+		return name
+	}
+	return receiver + "." + name
 }

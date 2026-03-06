@@ -96,3 +96,37 @@ func TestCSharpParser_ExtractsCallEdges(t *testing.T) {
 		}
 	}
 }
+
+func TestCSharpParser_UsesReceiverQualifiedIDsForMembers(t *testing.T) {
+	src := []byte(`namespace Demo.App;
+
+public class First {
+	private int count;
+	public void Render() {}
+}
+
+public class Second {
+	private int count;
+	public void Render() {}
+}
+`)
+
+	p := NewCSharpParser()
+	result, err := p.Parse("widget.cs", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	wantIDs := map[string]bool{
+		"widget.cs:First.count:field":    true,
+		"widget.cs:Second.count:field":   true,
+		"widget.cs:First.Render:method":  true,
+		"widget.cs:Second.Render:method": true,
+	}
+	for _, sym := range result.Symbols {
+		delete(wantIDs, sym.ID)
+	}
+	for id := range wantIDs {
+		t.Errorf("missing qualified symbol ID %q", id)
+	}
+}

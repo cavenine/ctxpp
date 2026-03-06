@@ -136,8 +136,9 @@ func csharpExtractMethod(n *sitter.Node, src []byte, filePath, namespaceName, en
 	if idx := strings.Index(sig, "{"); idx >= 0 {
 		sig = strings.TrimSpace(sig[:idx])
 	}
+	idName := qualifiedMemberName(enclosingType, name)
 	return &types.Symbol{
-		ID:         symbolID(filePath, name, types.KindMethod),
+		ID:         symbolID(filePath, idName, types.KindMethod),
 		File:       filePath,
 		Name:       name,
 		Kind:       types.KindMethod,
@@ -168,7 +169,7 @@ func csharpExtractFields(n *sitter.Node, src []byte, filePath, namespaceName, en
 		}
 		name := nodeText(nameNode, src)
 		out = append(out, types.Symbol{
-			ID:        symbolID(filePath, name, types.KindField),
+			ID:        symbolID(filePath, qualifiedMemberName(enclosingType, name), types.KindField),
 			File:      filePath,
 			Name:      name,
 			Kind:      types.KindField,

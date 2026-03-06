@@ -112,3 +112,37 @@ func TestKotlinParser_ExtractsCallEdges(t *testing.T) {
 		}
 	}
 }
+
+func TestKotlinParser_UsesReceiverQualifiedIDsForMembers(t *testing.T) {
+	src := []byte(`package demo
+
+class First {
+	val count = 1
+	fun render() {}
+}
+
+class Second {
+	val count = 2
+	fun render() {}
+}
+`)
+
+	p := NewKotlinParser()
+	result, err := p.Parse("widget.kt", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	wantIDs := map[string]bool{
+		"widget.kt:First.count:field":    true,
+		"widget.kt:Second.count:field":   true,
+		"widget.kt:First.render:method":  true,
+		"widget.kt:Second.render:method": true,
+	}
+	for _, sym := range result.Symbols {
+		delete(wantIDs, sym.ID)
+	}
+	for id := range wantIDs {
+		t.Errorf("missing qualified symbol ID %q", id)
+	}
+}
