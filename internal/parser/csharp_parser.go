@@ -93,7 +93,7 @@ func csharpNamespace(root *sitter.Node, src []byte) string {
 		child := root.Child(i)
 		switch child.Type() {
 		case "namespace_declaration", "file_scoped_namespace_declaration":
-			name := csharpQualifiedName(child, src)
+			name := csharpNodeName(child, src)
 			if name != "" {
 				return name
 			}
@@ -184,11 +184,44 @@ func csharpExtractFields(n *sitter.Node, src []byte, filePath, namespaceName, en
 }
 
 func csharpExtractImport(n *sitter.Node, src []byte, filePath string) *types.ImportEdge {
-	name := csharpQualifiedName(n, src)
+	name := csharpNodeName(n, src)
 	if name == "" {
 		return nil
 	}
 	return &types.ImportEdge{ImporterFile: filePath, ImportedPath: name}
+}
+
+func csharpNodeName(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	if n.Type() == "using_directive" {
+		for i := 0; i < int(n.ChildCount()); i++ {
+			child := n.Child(i)
+			if child.Type() == "qualified_name" {
+				return csharpQualifiedName(child, src)
+			}
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			child := n.Child(i)
+			if child.Type() == "identifier" {
+				if i+1 < int(n.ChildCount()) && n.Child(i+1).Type() == "=" {
+					continue
+				}
+				return csharpQualifiedName(child, src)
+			}
+		}
+	}
+	if nameNode := n.ChildByFieldName("name"); nameNode != nil {
+		return csharpQualifiedName(nameNode, src)
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child.Type() == "qualified_name" || child.Type() == "identifier" {
+			return csharpQualifiedName(child, src)
+		}
+	}
+	return ""
 }
 
 func csharpExtractCalls(n *sitter.Node, src []byte, filePath, callerSymbol string) []types.CallEdge {

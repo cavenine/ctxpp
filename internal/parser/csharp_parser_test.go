@@ -130,3 +130,53 @@ public class Second {
 		t.Errorf("missing qualified symbol ID %q", id)
 	}
 }
+
+func TestCSharpParser_ExtractsBlockScopedNamespaceOnly(t *testing.T) {
+	src := []byte(`namespace Demo.App {
+    public class Widget {}
+}
+`)
+
+	p := NewCSharpParser()
+	result, err := p.Parse("widget.cs", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	sym := findSymbol(result.Symbols, "Widget")
+	if sym == nil {
+		t.Fatal("symbol Widget not found")
+	}
+	if sym.Package != "Demo.App" {
+		t.Errorf("Package = %q, want %q", sym.Package, "Demo.App")
+	}
+}
+
+func TestCSharpParser_ExtractsAliasedUsingTarget(t *testing.T) {
+	src := []byte(`using IO = System.IO;
+using System.Text;
+
+namespace Demo.App;
+
+public class Widget {}
+`)
+
+	p := NewCSharpParser()
+	result, err := p.Parse("widget.cs", src)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	imports := map[string]bool{}
+	for _, edge := range result.ImportEdges {
+		imports[edge.ImportedPath] = true
+	}
+	for _, want := range []string{"System.IO", "System.Text"} {
+		if !imports[want] {
+			t.Errorf("missing import edge %q", want)
+		}
+	}
+	if imports["IO.System.IO"] {
+		t.Errorf("unexpected aliased import path %q", "IO.System.IO")
+	}
+}
