@@ -6,20 +6,28 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/cavenine/ctxpp/internal/hnsw"
 	"github.com/cavenine/ctxpp/internal/types"
-	"github.com/coder/hnsw"
 )
 
 type stubSemanticSearcher struct {
 	candidates []semanticCandidate
 	err        error
+	lastLimit  int
 }
 
-func (s stubSemanticSearcher) Search(_ []float32, _ int) ([]semanticCandidate, error) {
+func (s *stubSemanticSearcher) Search(_ []float32, limit int) ([]semanticCandidate, error) {
+	s.lastLimit = limit
 	if s.err != nil {
 		return nil, s.err
 	}
 	return s.candidates, nil
+}
+
+type panicSemanticSearcher struct{}
+
+func (s *panicSemanticSearcher) Search(_ []float32, _ int) ([]semanticCandidate, error) {
+	panic("boom")
 }
 
 func openTestStore(t *testing.T) *Store {
@@ -771,14 +779,14 @@ func TestSearchSemantic_ANNModeUsesANNSearcherWhenAvailable(t *testing.T) {
 	t.Cleanup(func() { newANNSemanticSearcher = origFactory })
 
 	newANNSemanticSearcher = func(_ *Store) (semanticSearcher, error) {
-		return stubSemanticSearcher{candidates: []semanticCandidate{{rowid: 0, score: 1}}}, nil
+		return &stubSemanticSearcher{candidates: []semanticCandidate{{rowid: 0, score: 1}}}, nil
 	}
 
 	st := openTestStoreWithOptions(t, OpenOptions{SemanticMode: SemanticModeANN})
 	if st.semanticMode != SemanticModeANN {
 		t.Fatalf("semanticMode = %q, want %q", st.semanticMode, SemanticModeANN)
 	}
-	if _, ok := st.semanticSearcher.(stubSemanticSearcher); !ok {
+	if _, ok := st.semanticSearcher.(*stubSemanticSearcher); !ok {
 		t.Fatalf("semanticSearcher type = %T, want stubSemanticSearcher", st.semanticSearcher)
 	}
 }
@@ -811,7 +819,7 @@ func TestSearchSemantic_ANNModeLoadsHNSWArtifactsWhenPresent(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(paths.Index), 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
-	meta := annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW, Model: "test-model", Dims: 3, Count: 1}
+	meta := annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW, Model: "test-model", Dims: 3, Count: 1, M: annGraphM, Ml: annGraphMl, EfSearch: annGraphEfSearch, Seed: annGraphSeed}
 	if err := writeANNMetadata(paths.Metadata, meta); err != nil {
 		t.Fatalf("writeANNMetadata() error = %v", err)
 	}
@@ -883,7 +891,7 @@ func TestSearchSemantic_ANNModeSearchesUsingHNSWArtifact(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	if err := writeANNMetadata(paths.Metadata, annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW}); err != nil {
+	if err := writeANNMetadata(paths.Metadata, annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW, M: annGraphM, Ml: annGraphMl, EfSearch: annGraphEfSearch, Seed: annGraphSeed}); err != nil {
 		t.Fatalf("writeANNMetadata() error = %v", err)
 	}
 
@@ -958,6 +966,59 @@ func TestBuildHNSWArtifactsFromEmbeddings_WritesSearchableIndexAndMetadata(t *te
 	}
 }
 
+func TestBuildANNArtifacts_RebuildPreservesSearchResultsForIdenticalInput(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "deterministic.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "deterministic.go:Alpha:function", File: "deterministic.go", Name: "Alpha", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "deterministic.go:Beta:function", File: "deterministic.go", Name: "Beta", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+			{ID: "deterministic.go:Gamma:function", File: "deterministic.go", Name: "Gamma", Kind: types.KindFunction, StartLine: 5, EndLine: 6},
+			{ID: "deterministic.go:Delta:function", File: "deterministic.go", Name: "Delta", Kind: types.KindFunction, StartLine: 7, EndLine: 8},
+		},
+	)
+	for _, tc := range []struct {
+		symbolID string
+		vector   []float32
+	}{
+		{symbolID: "deterministic.go:Alpha:function", vector: []float32{1, 0, 0}},
+		{symbolID: "deterministic.go:Beta:function", vector: []float32{0.8, 0.2, 0}},
+		{symbolID: "deterministic.go:Gamma:function", vector: []float32{0.6, 0.3, 0.1}},
+		{symbolID: "deterministic.go:Delta:function", vector: []float32{0.4, 0.2, 0.4}},
+	} {
+		if err := st.UpsertEmbedding(tc.symbolID, "test-model", tc.vector); err != nil {
+			t.Fatalf("UpsertEmbedding(%s) error = %v", tc.symbolID, err)
+		}
+	}
+
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() first error = %v", err)
+	}
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	first, err := annStore.SearchSemantic([]float32{1, 0, 0}, 3)
+	if err != nil {
+		t.Fatalf("SearchSemantic() first error = %v", err)
+	}
+
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() second error = %v", err)
+	}
+	annStore = openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	second, err := annStore.SearchSemantic([]float32{1, 0, 0}, 3)
+	if err != nil {
+		t.Fatalf("SearchSemantic() second error = %v", err)
+	}
+	if len(first) != len(second) {
+		t.Fatalf("result count changed across rebuilds: %d != %d", len(first), len(second))
+	}
+	for i := range first {
+		if first[i].ID != second[i].ID {
+			t.Fatalf("result %d changed across rebuilds: %q != %q", i, first[i].ID, second[i].ID)
+		}
+	}
+}
+
 func TestSearchSemantic_ANNModeRebuildsArtifactsWhenMetadataIsStale(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
 	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
@@ -992,7 +1053,7 @@ func TestSearchSemantic_ANNModeRebuildsArtifactsWhenMetadataIsStale(t *testing.T
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	if err := writeANNMetadata(paths.Metadata, annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW, Model: "stale-model", Dims: 3, Count: 1}); err != nil {
+	if err := writeANNMetadata(paths.Metadata, annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW, Model: "stale-model", Dims: 3, Count: 1, M: annGraphM, Ml: annGraphMl, EfSearch: annGraphEfSearch, Seed: annGraphSeed}); err != nil {
 		t.Fatalf("writeANNMetadata() error = %v", err)
 	}
 
@@ -1068,6 +1129,154 @@ func TestUpsertEmbedding_RebuildsExistingANNArtifacts(t *testing.T) {
 	}
 	if got[1].Name != "Near" && got[1].Name != "New" {
 		t.Fatalf("second result = %q, want Near or New after ANN sync", got[1].Name)
+	}
+}
+
+func TestUpsertEmbedding_ANNArtifactsExcludeVendorAndStayConsistent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "vendor/lib.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{
+			ID: "vendor/lib.go:Vendor:function", File: "vendor/lib.go", Name: "Vendor",
+			Kind: types.KindFunction, StartLine: 1, EndLine: 2, SourceTier: types.TierVendor,
+		}},
+	)
+	seedFile(t, st,
+		types.FileRecord{Path: "app.go", SHA256: "r", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{
+			ID: "app.go:Code:function", File: "app.go", Name: "Code",
+			Kind: types.KindFunction, StartLine: 1, EndLine: 2, SourceTier: types.TierCode,
+		}},
+	)
+	if err := st.UpsertEmbedding("vendor/lib.go:Vendor:function", "sync-model", []float32{0, 1, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(vendor) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("app.go:Code:function", "sync-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(code) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	baselineStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	baseline, err := baselineStore.SearchSemantic([]float32{0, 1, 0}, 2)
+	if err != nil {
+		t.Fatalf("baseline SearchSemantic() error = %v", err)
+	}
+	if len(baseline) != 1 {
+		t.Fatalf("baseline SearchSemantic() returned %d results, want 1", len(baseline))
+	}
+	if baseline[0].Name != "Code" {
+		t.Fatalf("baseline top result = %q, want Code", baseline[0].Name)
+	}
+
+	if err := st.UpsertEmbedding("vendor/lib.go:Vendor:function", "sync-model", []float32{0, 1, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(vendor second) error = %v", err)
+	}
+
+	meta, err := readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Count != 1 {
+		t.Fatalf("Count = %d, want 1 after incremental upsert", meta.Count)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{0, 1, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("SearchSemantic() returned %d results, want 1", len(got))
+	}
+	if got[0].Name != "Code" {
+		t.Fatalf("top result after incremental upsert = %q, want Code", got[0].Name)
+	}
+}
+
+func TestSearchSemantic_ANNModeIgnoresVendorDistractorsDuringCandidateGeneration(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "signal.go", SHA256: "a", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "signal.go:Target:function", File: "signal.go", Name: "Target", Kind: types.KindFunction, StartLine: 1, EndLine: 2, SourceTier: types.TierCode}},
+	)
+	for i := 0; i < 64; i++ {
+		path := filepath.Join("vendor", "dep", "file"+strconv.Itoa(i)+".go")
+		symbolID := path + ":Noise:function"
+		seedFile(t, st,
+			types.FileRecord{Path: path, SHA256: strconv.Itoa(i), ModTime: int64(i + 2), Lang: "go"},
+			[]types.Symbol{{ID: symbolID, File: path, Name: "Noise", Kind: types.KindFunction, StartLine: 1, EndLine: 2, SourceTier: types.TierVendor}},
+		)
+		if err := st.UpsertEmbedding(symbolID, "ann-model", []float32{1, 0, 0}); err != nil {
+			t.Fatalf("UpsertEmbedding(%s) error = %v", symbolID, err)
+		}
+	}
+	if err := st.UpsertEmbedding("signal.go:Target:function", "ann-model", []float32{0, 1, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(target) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{0, 1, 0}, 5)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("SearchSemantic() returned %d results, want 1", len(got))
+	}
+	if got[0].Name != "Target" {
+		t.Fatalf("top result = %q, want Target", got[0].Name)
+	}
+}
+
+func TestSearchSemantic_ANNModeIgnoresConstDistractorsDuringCandidateGeneration(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "signal.go", SHA256: "a", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "signal.go:Target:function", File: "signal.go", Name: "Target", Kind: types.KindFunction, StartLine: 1, EndLine: 2, SourceTier: types.TierCode}},
+	)
+	for i := 0; i < 64; i++ {
+		path := filepath.Join("pkg", "noise", "file"+strconv.Itoa(i)+".go")
+		symbolID := path + ":Noise:const"
+		seedFile(t, st,
+			types.FileRecord{Path: path, SHA256: "const-" + strconv.Itoa(i), ModTime: int64(i + 2), Lang: "go"},
+			[]types.Symbol{{ID: symbolID, File: path, Name: "Noise", Kind: types.KindConst, StartLine: 1, EndLine: 1, SourceTier: types.TierCode}},
+		)
+		if err := st.UpsertEmbedding(symbolID, "ann-model", []float32{1, 0, 0}); err != nil {
+			t.Fatalf("UpsertEmbedding(%s) error = %v", symbolID, err)
+		}
+	}
+	if err := st.UpsertEmbedding("signal.go:Target:function", "ann-model", []float32{0, 1, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(target) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	meta, err := readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Count != 1 {
+		t.Fatalf("Count = %d, want 1 after excluding const distractors", meta.Count)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{0, 1, 0}, 5)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("SearchSemantic() returned %d results, want 1", len(got))
+	}
+	if got[0].Name != "Target" {
+		t.Fatalf("top result = %q, want Target", got[0].Name)
 	}
 }
 
@@ -1600,7 +1809,7 @@ func TestSearchSemantic_UsesConfiguredSearcher(t *testing.T) {
 		t.Fatalf("rowid beta lookup error = %v", err)
 	}
 
-	st.semanticSearcher = stubSemanticSearcher{candidates: []semanticCandidate{
+	st.semanticSearcher = &stubSemanticSearcher{candidates: []semanticCandidate{
 		{rowid: betaRowID, score: 0.95},
 	}}
 
@@ -1613,6 +1822,89 @@ func TestSearchSemantic_UsesConfiguredSearcher(t *testing.T) {
 	}
 	if got[0].Name != "Beta" {
 		t.Fatalf("top result = %q, want Beta", got[0].Name)
+	}
+}
+
+func TestSearchSemantic_ANNModeRequestsLargerCandidatePool(t *testing.T) {
+	st := openTestStore(t)
+	st.semanticMode = SemanticModeANN
+	searcher := &stubSemanticSearcher{}
+	st.semanticSearcher = searcher
+
+	if _, err := st.SearchSemantic([]float32{1, 0, 0}, 5); err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if searcher.lastLimit <= 15 {
+		t.Fatalf("candidate limit = %d, want > 15 for ANN overfetch", searcher.lastLimit)
+	}
+}
+
+func TestSearchSemantic_ANNModeFallsBackToBruteForceAfterSearcherPanic(t *testing.T) {
+	st := openTestStore(t)
+	seedFile(t, st,
+		types.FileRecord{Path: "panic.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "panic.go:Near:function", File: "panic.go", Name: "Near", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "panic.go:Far:function", File: "panic.go", Name: "Far", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+	if err := st.UpsertEmbedding("panic.go:Near:function", "m", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(near) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("panic.go:Far:function", "m", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(far) error = %v", err)
+	}
+
+	st.semanticMode = SemanticModeANN
+	st.semanticSearcher = &panicSemanticSearcher{}
+
+	got, err := st.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchSemantic() returned %d results, want 2", len(got))
+	}
+	if got[0].Name != "Near" {
+		t.Fatalf("top result = %q, want Near", got[0].Name)
+	}
+	if st.semanticMode != SemanticModeBruteForce {
+		t.Fatalf("semanticMode = %q, want %q", st.semanticMode, SemanticModeBruteForce)
+	}
+	if _, ok := st.currentSemanticSearcher().(*bruteForceSemanticSearcher); !ok {
+		t.Fatalf("semanticSearcher type = %T, want *bruteForceSemanticSearcher", st.currentSemanticSearcher())
+	}
+}
+
+func TestSearchHybrid_ANNModeFallsBackToBruteForceAfterSearcherPanic(t *testing.T) {
+	st := openTestStore(t)
+	seedFile(t, st,
+		types.FileRecord{Path: "panic_hybrid.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{
+			ID: "panic_hybrid.go:HandleRequest:function", File: "panic_hybrid.go", Name: "HandleRequest",
+			Kind: types.KindFunction, Signature: "func HandleRequest()", DocComment: "handles request routing",
+			StartLine: 1, EndLine: 2,
+		}},
+	)
+	if err := st.UpsertEmbedding("panic_hybrid.go:HandleRequest:function", "m", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding() error = %v", err)
+	}
+
+	st.semanticMode = SemanticModeANN
+	st.semanticSearcher = &panicSemanticSearcher{}
+
+	got, err := st.SearchHybrid([]float32{1, 0, 0}, "HandleRequest routing", 1)
+	if err != nil {
+		t.Fatalf("SearchHybrid() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("SearchHybrid() returned %d results, want 1", len(got))
+	}
+	if got[0].Name != "HandleRequest" {
+		t.Fatalf("top result = %q, want HandleRequest", got[0].Name)
+	}
+	if st.semanticMode != SemanticModeBruteForce {
+		t.Fatalf("semanticMode = %q, want %q", st.semanticMode, SemanticModeBruteForce)
 	}
 }
 
@@ -1642,7 +1934,7 @@ func TestSearchSemantic_RecomputesExactScoresAfterCandidateGeneration(t *testing
 		t.Fatalf("rowid far lookup error = %v", err)
 	}
 
-	st.semanticSearcher = stubSemanticSearcher{candidates: []semanticCandidate{
+	st.semanticSearcher = &stubSemanticSearcher{candidates: []semanticCandidate{
 		{rowid: farRowID, score: 0.99},
 		{rowid: nearRowID, score: 0.01},
 	}}

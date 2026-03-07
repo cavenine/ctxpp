@@ -399,6 +399,8 @@ Interpretation:
 - `go test ./...`
 - `go vet ./...`
 - `go test -race ./...`
+- `go run ./bench/ann_eval -db /path/to/.ctxpp/index.db -mode quality`
+- `go run ./bench/ann_eval -db /path/to/.ctxpp/index.db -mode latency`
 
 And benchmark runs under `bench/` using the kubernetes corpus or a similarly large repository.
 

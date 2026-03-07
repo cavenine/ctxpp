@@ -95,6 +95,8 @@ pie title Symbol Distribution by Tier (kubernetes, ctx++)
 
 ## Performance
 
+Primary comparison below is the original brute-force ctx++ result used for the head-to-head benchmark. ANN follow-up numbers for ctx++ are listed immediately after this table.
+
 | Metric | ctx++ | codemogger | Context+ |
 |--------|-------|------------|----------|
 | Index time | 47m 14s | 1h 9m 33s | **2m 7s**‡ |
@@ -107,6 +109,8 @@ pie title Symbol Distribution by Tier (kubernetes, ctx++)
 ### ANN follow-up on the same Kubernetes index
 
 After the HNSW ANN prototype landed, the same Kubernetes index at `317,983` embeddings was re-measured without reindexing from source. The existing SQLite index at `/tmp/bench-k8s-ctxpp/.ctxpp/index.db` was reused.
+
+Implementation details and rollout notes live in [`docs/ANN-VECTOR-INDEX-PLAN.md`](../docs/ANN-VECTOR-INDEX-PLAN.md). User-facing setup and runtime examples live in [`README.md`](../README.md#configuration) and [`README.md`](../README.md#quick-start).
 
 | Metric | ctx++ brute-force | ctx++ ANN |
 |--------|-------------------|-----------|
@@ -132,6 +136,35 @@ Projected impact on the original Kubernetes full index benchmark:
 
 That is roughly a **1.4% increase** in full indexing time in exchange for the much lower semantic query latency above.
 
+### ANN quality check on the same Kubernetes index
+
+Quality was also compared on the Ollama / `bge-m3` Kubernetes index by running the same 10 hybrid-mode queries used in Benchmark 1 against:
+
+- `CTXPP_VECTOR_INDEX=bruteforce`
+- `CTXPP_VECTOR_INDEX=ann`
+
+Observed result:
+
+| Metric | Result |
+|--------|--------|
+| Queries with identical top-5 vs brute-force | 0 / 10 |
+| Queries with the brute-force top-1 still present somewhere in ANN top-5 | 2 / 10 |
+| Queries with an exact top-1 match | 0 / 10 |
+
+Representative regressions:
+
+- **Q3 (service discovery and endpoint routing)**
+  - brute-force: `addressToEndpoint`, `LocalReadyEndpoints`, `NewEndpointServiceResolver`, ...
+  - ANN: `SwaggerDoc`, `map_IngressTLS`, `map_IngressLoadBalancerIngress`, ...
+- **Q7 (API server admission controller webhook)**
+  - brute-force: `Webhook`, `WebhookAccessor`, `GetValidatingWebhook`, ...
+  - ANN: `TIOCCBRK`, `TIOCRCVFRAME`, `TIOCCDTR`, ...
+- **Q8 (horizontal pod autoscaler scaling logic)**
+  - brute-force: `HorizontalPodAutoscalerBehavior`, `HorizontalPodAutoscaler`, ...
+  - ANN: `sizeField`, `sizeMap`, `sizeMessageSlow`, ...
+
+Conclusion: the current HNSW prototype delivers the expected latency win, but **it is not yet quality-safe on Kubernetes-scale hybrid search**. Until recall/candidate quality is fixed, ANN should be treated as experimental and the brute-force path remains the relevance baseline.
+
 ‡ Context+ builds embeddings lazily on the first search call rather than eagerly at index time. The 2m 7s figure is the wall-clock time for that first `semantic_code_search` invocation to return — it is not a full corpus index. ctx++ and codemogger fully embed the entire corpus before any search is issued; Context+ does not. The figure is not directly comparable to the other two index times.
 
 ```mermaid
@@ -155,7 +188,7 @@ xychart-beta
 ## Search Quality (10 Queries)
 
 Ten natural-language queries targeting well-known Kubernetes subsystems.
-ctx++ uses **hybrid mode** (RRF + call-graph reranking). Each query graded
+The main table below reflects the original brute-force ctx++ run used for the benchmark report. ANN-specific quality follow-up results are listed immediately after the main quality summary. ctx++ uses **hybrid mode** (RRF + call-graph reranking). Each query graded
 by top-5 result relevance to actual implementation code.
 
 ### Results by Query
@@ -256,6 +289,22 @@ by top-5 result relevance to actual implementation code.
 | Q10 (network policy) | **4/5** | 3/5 | 2/5 |
 | **Avg** | **4.8** | **3.9** | **2.2** |
 
+### ANN Quality Follow-up
+
+ANN was evaluated on the same Ollama / `bge-m3` Kubernetes index by re-running the same 10 hybrid-mode queries with `CTXPP_VECTOR_INDEX=ann` and comparing them directly to the brute-force baseline.
+
+| Metric | ANN vs brute-force |
+|--------|--------------------|
+| Identical top-5 result sets | 0 / 10 |
+| Brute-force top-1 still present in ANN top-5 | 2 / 10 |
+| Exact top-1 match | 0 / 10 |
+
+Interpretation:
+
+- ANN latency is excellent, but the current HNSW prototype is not yet quality-safe on Kubernetes-scale hybrid retrieval.
+- The brute-force path remains the quality baseline and should still be treated as the benchmarked relevance result.
+- ANN should be considered experimental until recall/candidate quality improves materially.
+
 ```mermaid
 xychart-beta
     title "Search Quality (avg / 5)"
@@ -266,7 +315,7 @@ xychart-beta
 
 ### Quality Analysis
 
-**ctx++ leads (4.8/5), ahead of codemogger (3.9/5) by 0.9 points.** ctx++ wins or ties on all 10 queries. Three changes drove the improvement:
+**ctx++ brute-force leads (4.8/5), ahead of codemogger (3.9/5) by 0.9 points.** ctx++ wins or ties on all 10 queries. Three changes drove the improvement:
 
 1. **FTS query preprocessing.** Stripping stopwords ("and", "the", etc.) from FTS queries gives cleaner BM25 signal. For Q9, "etcd storage and watch mechanism" becomes "etcd storage watch mechanism", eliminating noise from the word "and".
 
@@ -414,7 +463,8 @@ xychart-beta
 
 | Benchmark | ctx++ | codemogger | Context+ |
 |-----------|-------|------------|----------|
-| Benchmark 1: kubernetes (Ollama/bge-m3) | **4.8/5** | 3.9/5 | 2.2/5 |
+| Benchmark 1: kubernetes (Ollama/bge-m3, brute-force) | **4.8/5** | 3.9/5 | 2.2/5 |
+| Benchmark 1 follow-up: kubernetes (Ollama/bge-m3, ANN) | experimental / regressed recall | — | — |
 | Benchmark 2: kubernetes (Bedrock/Titan v2) | **4.7/5** | — | — |
 
 ```mermaid
@@ -429,7 +479,8 @@ xychart-beta
 
 | Benchmark | Tool | Index time | DB size | Peak RSS |
 |-----------|------|-----------|---------|---------|
-| Benchmark 1: kubernetes (Ollama/bge-m3) | ctx++ | 47m 14s | 1.9 GiB | 1.1 GiB |
+| Benchmark 1: kubernetes (Ollama/bge-m3, brute-force) | ctx++ | 47m 14s | 1.9 GiB | 1.1 GiB |
+| Benchmark 1 follow-up: kubernetes (Ollama/bge-m3, ANN) | ctx++ | ~47m 55s projected | 1.9 GiB + ANN artifacts | 1.1 GiB |
 | Benchmark 1: kubernetes (Ollama/bge-m3) | codemogger | 1h 9m 33s | 416.0 MiB | 120.6 MiB |
 | Benchmark 1: kubernetes (Ollama/bge-m3) | Context+ | 2m 7s | 218.7 MiB | 121.1 MiB |
 | Benchmark 2: kubernetes (Bedrock/Titan v2) | ctx++ | ~7.5 hours | 1.9 GiB | ~1.1 GiB |
@@ -438,7 +489,7 @@ xychart-beta
 
 ## Conclusions
 
-1. **ctx++ leads on search quality across all benchmarks.** 4.8/5 on kubernetes (Ollama) and 4.7/5 on kubernetes (Bedrock), ahead of codemogger (3.9/5) and Context+ (2.2/5).
+1. **ctx++ brute-force leads on search quality across all completed benchmarks.** 4.8/5 on kubernetes (Ollama) and 4.7/5 on kubernetes (Bedrock), ahead of codemogger (3.9/5) and Context+ (2.2/5).
 
 2. **Symbol-level embedding with hybrid RRF search is the winning combination.** Fine-grained symbol extraction produces tight semantic matches, while RRF fusion with stopword-filtered FTS catches keyword-exact matches the embedding model misses.
 
@@ -452,4 +503,6 @@ xychart-beta
 
 7. **AWS Bedrock is a viable cloud alternative to local GPU.** Titan v2 achieves 4.7/5 quality (vs 4.8/5 for bge-m3), within noise. The trade-off is higher per-query latency (100–460 ms vs ~25 ms) offset by horizontal scaling (100–200 concurrent API calls). For CI/CD, cloud-hosted agents, or environments without GPU, Bedrock eliminates the GPU dependency.
 
-8. **Memory is the main trade-off for ctx++.** At ~1.1 GiB for kubernetes, ctx++ holds vectors in-process for fast scan. codemogger and Context+ stay at ~120 MiB. This is acceptable for developer workstations but worth monitoring for larger corpora.
+8. **ANN is promising on latency but not yet ready on quality.** On the Ollama Kubernetes index, ANN drops end-to-end semantic query latency from ~759 ms to ~26 ms, but the current prototype materially regresses hybrid search quality versus brute-force.
+
+9. **Memory is the main trade-off for ctx++.** At ~1.1 GiB for kubernetes, ctx++ holds vectors in-process for fast scan. codemogger and Context+ stay at ~120 MiB. This is acceptable for developer workstations but worth monitoring for larger corpora.

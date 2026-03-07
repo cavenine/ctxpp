@@ -310,6 +310,24 @@ func (s *Store) replaceSemanticSearcher(searcher semanticSearcher) {
 	s.semanticMu.Unlock()
 }
 
+func (s *Store) fallbackToBruteForceSearcher() semanticSearcher {
+	searcher := &bruteForceSemanticSearcher{store: s}
+	s.semanticMu.Lock()
+	s.semanticSearcher = searcher
+	s.semanticMode = SemanticModeBruteForce
+	s.semanticMu.Unlock()
+	return searcher
+}
+
+func (s *Store) safeSemanticSearch(searcher semanticSearcher, queryVec []float32, limit int) (candidates []semanticCandidate, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("semantic search panic: %v", r)
+		}
+	}()
+	return searcher.Search(queryVec, limit)
+}
+
 func (s *Store) waitForBackgroundANNRebuild() error {
 	s.annSyncMu.Lock()
 	done := s.annRebuildDone
@@ -611,21 +629,93 @@ type bruteForceSemanticSearcher struct {
 	store *Store
 }
 
+type SemanticDebugCandidate struct {
+	RowID int64   `json:"rowid"`
+	Score float32 `json:"score"`
+}
+
+type SemanticDebugResult struct {
+	ConfiguredMode  SemanticMode             `json:"configured_mode"`
+	EffectiveMode   SemanticMode             `json:"effective_mode"`
+	CandidateLimit  int                      `json:"candidate_limit"`
+	FallbackApplied bool                     `json:"fallback_applied"`
+	Candidates      []SemanticDebugCandidate `json:"candidates"`
+	Results         []types.Symbol           `json:"results"`
+}
+
 // SearchSemantic performs cosine similarity search using the configured
 // semantic searcher, then applies the existing exact ranking pipeline:
 // source-tier weighting, symbol hydration, and deduplication. The default
 // searcher is a brute-force scan, but this orchestration layer is the seam for
 // future ANN candidate generation.
 func (s *Store) SearchSemantic(queryVec []float32, limit int) ([]types.Symbol, error) {
-	if limit <= 0 {
-		limit = 10
-	}
-	searcher := s.currentSemanticSearcher()
-	candidates, err := searcher.Search(queryVec, limit*3)
+	debug, err := s.DebugSemanticQuery(queryVec, limit)
 	if err != nil {
 		return nil, err
 	}
-	return s.hydrateSemanticCandidates(queryVec, candidates, limit)
+	return debug.Results, nil
+}
+
+func (s *Store) DebugSemanticQuery(queryVec []float32, limit int) (SemanticDebugResult, error) {
+	return s.debugSemanticQuery(queryVec, limit, 0)
+}
+
+func (s *Store) DebugSemanticQueryWithCandidateLimit(queryVec []float32, limit int, candidateLimit int) (SemanticDebugResult, error) {
+	return s.debugSemanticQuery(queryVec, limit, candidateLimit)
+}
+
+func (s *Store) debugSemanticQuery(queryVec []float32, limit int, candidateLimit int) (SemanticDebugResult, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	configuredMode := s.semanticMode
+	if candidateLimit <= 0 {
+		candidateLimit = s.semanticCandidateLimit(limit)
+	}
+	searcher := s.currentSemanticSearcher()
+	candidates, err := s.safeSemanticSearch(searcher, queryVec, candidateLimit)
+	fallbackApplied := false
+	if err != nil && s.semanticMode == SemanticModeANN {
+		fallbackApplied = true
+		searcher = s.fallbackToBruteForceSearcher()
+		if candidateLimit <= 0 {
+			candidateLimit = s.semanticCandidateLimit(limit)
+		}
+		candidates, err = s.safeSemanticSearch(searcher, queryVec, candidateLimit)
+	}
+	if err != nil {
+		return SemanticDebugResult{}, err
+	}
+	results, err := s.hydrateSemanticCandidates(queryVec, candidates, limit)
+	if err != nil {
+		return SemanticDebugResult{}, err
+	}
+	debugCandidates := make([]SemanticDebugCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		debugCandidates = append(debugCandidates, SemanticDebugCandidate{RowID: candidate.rowid, Score: candidate.score})
+	}
+	return SemanticDebugResult{
+		ConfiguredMode:  configuredMode,
+		EffectiveMode:   s.semanticMode,
+		CandidateLimit:  candidateLimit,
+		FallbackApplied: fallbackApplied,
+		Candidates:      debugCandidates,
+		Results:         results,
+	}, nil
+}
+
+func (s *Store) semanticCandidateLimit(limit int) int {
+	if limit <= 0 {
+		limit = 10
+	}
+	if s.semanticMode == SemanticModeANN {
+		candidateLimit := limit * 400
+		if candidateLimit < 4096 {
+			candidateLimit = 4096
+		}
+		return candidateLimit
+	}
+	return limit * 3
 }
 
 // Search performs brute-force cosine similarity search by comparing query

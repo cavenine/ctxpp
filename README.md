@@ -111,6 +111,8 @@ ctxpp index --path /path/to/your/project --force
 
 The examples below use Ollama with `bge-m3` (the default). If Ollama is not running, omit `CTXPP_OLLAMA_*` — ctx++ will fall back to keyword search only.
 
+To enable the ANN vector index explicitly, set `CTXPP_VECTOR_INDEX=ann`. To let ctx++ decide automatically, use the default `CTXPP_VECTOR_INDEX=auto`.
+
 **OpenCode** (`opencode.json` in project root):
 
 ```json
@@ -122,6 +124,7 @@ The examples below use Ollama with `bge-m3` (the default). If Ollama is not runn
       "enabled": true,
       "environment": {
         "CTXPP_PROJECT": "/path/to/your/project",
+        "CTXPP_VECTOR_INDEX": "ann",
         "CTXPP_OLLAMA_URL": "http://localhost:11434",
         "CTXPP_OLLAMA_MODEL": "bge-m3"
       }
@@ -140,6 +143,7 @@ The examples below use Ollama with `bge-m3` (the default). If Ollama is not runn
       "args": ["mcp"],
       "env": {
         "CTXPP_PROJECT": "/path/to/your/project",
+        "CTXPP_VECTOR_INDEX": "ann",
         "CTXPP_OLLAMA_URL": "http://localhost:11434",
         "CTXPP_OLLAMA_MODEL": "bge-m3"
       }
@@ -158,6 +162,7 @@ The examples below use Ollama with `bge-m3` (the default). If Ollama is not runn
       "args": ["mcp"],
       "env": {
         "CTXPP_PROJECT": "/path/to/your/project",
+        "CTXPP_VECTOR_INDEX": "ann",
         "CTXPP_OLLAMA_URL": "http://localhost:11434",
         "CTXPP_OLLAMA_MODEL": "bge-m3"
       }
@@ -185,6 +190,57 @@ use ctxpp_blast_radius to tell me what breaks if I change the Account struct
 ```
 use ctxpp_ann_status to check whether ANN search is healthy or rebuilding
 ```
+
+### 4. ANN usage
+
+ctx++ supports three vector-index modes:
+
+- `CTXPP_VECTOR_INDEX=auto` — default; use ANN when healthy artifacts are present, otherwise fall back to brute-force search
+- `CTXPP_VECTOR_INDEX=bruteforce` — always use SQLite-backed brute-force vector search
+- `CTXPP_VECTOR_INDEX=ann` — prefer ANN and build/load ANN artifacts under `.ctxpp/`
+
+Current status: ANN is implemented, fast, and usable for experimentation, but it is still **experimental**. The brute-force path remains the relevance baseline until ANN recall quality is improved on very large corpora.
+
+ANN artifacts live next to the main SQLite index:
+
+```
+.ctxpp/
+  index.db
+  ann-hnsw.bin
+  ann-hnsw.json
+```
+
+Recommended interactive setup with ANN enabled:
+
+```bash
+export CTXPP_PROJECT=/path/to/your/project
+export CTXPP_VECTOR_INDEX=ann
+export CTXPP_OLLAMA_MODEL=bge-m3
+ctxpp index --path "$CTXPP_PROJECT"
+ctxpp mcp
+```
+
+Check ANN health at any time:
+
+```bash
+ctxpp_ann_status
+```
+
+Or from an MCP client / agent prompt:
+
+```
+use ctxpp_ann_status to confirm ANN is healthy before running semantic search
+```
+
+Compare ANN against the brute-force baseline on an existing index:
+
+```bash
+go run ./bench/ann_eval -db .ctxpp/index.db -mode quality
+go run ./bench/ann_eval -db .ctxpp/index.db -mode latency
+```
+
+Use `-format json` for machine-readable output and `-search semantic` to compare
+semantic-only retrieval instead of the default hybrid path.
 
 ---
 

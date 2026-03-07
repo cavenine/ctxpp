@@ -3,19 +3,37 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
-	"github.com/coder/hnsw"
+	"github.com/cavenine/ctxpp/internal/hnsw"
+	"github.com/cavenine/ctxpp/internal/types"
 )
 
 var annBackgroundRebuildHook func()
 
+const annTierCutoff = types.TierCode
+
+var annExcludedKinds = []types.SymbolKind{
+	types.KindConst,
+	types.KindVar,
+	types.KindDocument,
+	types.KindSection,
+	types.KindElement,
+}
+
 const (
 	annFormatVersion = 1
 	annEngineHNSW    = "hnsw"
+	annGraphM        = 64
+	annGraphMl       = 0.25
+	annGraphEfSearch = 16384
+	annGraphSeed     = 1
+	annGraphAltSeed  = 2
+	annSearchPasses  = 1
 )
 
 type annPaths struct {
@@ -24,11 +42,15 @@ type annPaths struct {
 }
 
 type annMetadata struct {
-	FormatVersion int    `json:"format_version"`
-	Engine        string `json:"engine"`
-	Model         string `json:"model"`
-	Dims          int    `json:"dims"`
-	Count         int    `json:"count"`
+	FormatVersion int     `json:"format_version"`
+	Engine        string  `json:"engine"`
+	Model         string  `json:"model"`
+	Dims          int     `json:"dims"`
+	Count         int     `json:"count"`
+	M             int     `json:"m,omitempty"`
+	Ml            float64 `json:"ml,omitempty"`
+	EfSearch      int     `json:"ef_search,omitempty"`
+	Seed          int64   `json:"seed,omitempty"`
 }
 
 type hnswSemanticSearcher struct {
@@ -36,6 +58,7 @@ type hnswSemanticSearcher struct {
 	metadata annMetadata
 	mu       sync.RWMutex
 	graph    *hnsw.SavedGraph[int64]
+	altGraph *hnsw.Graph[int64]
 }
 
 func annArtifactPaths(dbPath string) annPaths {
@@ -191,7 +214,7 @@ func (s *Store) syncANNEmbeddingUpsertsIfPresent(symbolIDs []string) error {
 	if err != nil {
 		return s.syncANNArtifactsMaybeAsync()
 	}
-	if stored.FormatVersion != annFormatVersion || stored.Engine != annEngineHNSW || stored.Model != current.Model || stored.Dims != current.Dims || current.Count < stored.Count {
+	if stored.FormatVersion != annFormatVersion || stored.Engine != annEngineHNSW || stored.Model != current.Model || stored.Dims != current.Dims || current.Count < stored.Count || stored.M != annGraphM || stored.Ml != annGraphMl || stored.EfSearch != annGraphEfSearch || stored.Seed != annGraphSeed {
 		return s.syncANNArtifactsMaybeAsync()
 	}
 	graph, err := hnsw.LoadSavedGraph[int64](paths.Index)
@@ -253,7 +276,7 @@ func (s *Store) syncANNEmbeddingDeletesIfPresent(rowIDs []int64) error {
 	if err != nil {
 		return s.syncANNArtifactsMaybeAsync()
 	}
-	if stored.FormatVersion != annFormatVersion || stored.Engine != annEngineHNSW || stored.Model != current.Model || stored.Dims != current.Dims || current.Count > stored.Count {
+	if stored.FormatVersion != annFormatVersion || stored.Engine != annEngineHNSW || stored.Model != current.Model || stored.Dims != current.Dims || current.Count > stored.Count || stored.M != annGraphM || stored.Ml != annGraphMl || stored.EfSearch != annGraphEfSearch || stored.Seed != annGraphSeed {
 		return s.syncANNArtifactsMaybeAsync()
 	}
 	graph, err := hnsw.LoadSavedGraph[int64](paths.Index)
@@ -321,7 +344,18 @@ func (s *Store) annNodesBySymbolIDs(symbolIDs []string) ([]hnsw.Node[int64], err
 	for _, id := range symbolIDs {
 		args = append(args, id)
 	}
-	rows, err := s.db.Query(`SELECT rowid, vector FROM embeddings WHERE symbol_id IN (`+placeholders+`)`, args...)
+	queryArgs := make([]any, 0, len(args)+1+len(annExcludedKinds))
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, annTierCutoff)
+	for _, kind := range annExcludedKinds {
+		queryArgs = append(queryArgs, kind)
+	}
+	rows, err := s.db.Query(`
+		SELECT e.rowid, e.vector
+		FROM embeddings e
+		JOIN symbols s ON s.id = e.symbol_id
+		WHERE e.symbol_id IN (`+placeholders+`) AND `+annEligibilityWhereSQL("s")+`
+	`, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("query embedding nodes: %w", err)
 	}
@@ -389,6 +423,18 @@ func newHNSWSemanticSearcher(s *Store) (semanticSearcher, error) {
 	if meta.Dims <= 0 {
 		return nil, fmt.Errorf("load hnsw metadata: invalid dims %d", meta.Dims)
 	}
+	if meta.M != annGraphM {
+		return nil, fmt.Errorf("load hnsw metadata: m mismatch %d != %d", meta.M, annGraphM)
+	}
+	if meta.EfSearch != annGraphEfSearch {
+		return nil, fmt.Errorf("load hnsw metadata: ef_search mismatch %d != %d", meta.EfSearch, annGraphEfSearch)
+	}
+	if meta.Ml != annGraphMl {
+		return nil, fmt.Errorf("load hnsw metadata: ml mismatch %v != %v", meta.Ml, annGraphMl)
+	}
+	if meta.Seed != annGraphSeed {
+		return nil, fmt.Errorf("load hnsw metadata: seed mismatch %d != %d", meta.Seed, annGraphSeed)
+	}
 	if err := s.validateANNMetadata(meta); err != nil {
 		return nil, fmt.Errorf("load hnsw metadata: %w", err)
 	}
@@ -399,7 +445,31 @@ func newHNSWSemanticSearcher(s *Store) (semanticSearcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load hnsw graph: %w", err)
 	}
-	return &hnswSemanticSearcher{paths: paths, metadata: meta, graph: graph}, nil
+	altGraph, err := s.buildInMemoryHNSWGraph(annGraphAltSeed)
+	if err != nil {
+		return nil, fmt.Errorf("load hnsw graph: build alt graph: %w", err)
+	}
+	return &hnswSemanticSearcher{paths: paths, metadata: meta, graph: graph, altGraph: altGraph}, nil
+}
+
+func (s *Store) buildInMemoryHNSWGraph(seed int64) (*hnsw.Graph[int64], error) {
+	nodes, err := s.annAllNodes()
+	if err != nil {
+		return nil, fmt.Errorf("query ann nodes: %w", err)
+	}
+	graph := hnsw.NewGraph[int64]()
+	graph.M = annGraphM
+	graph.Ml = annGraphMl
+	graph.EfSearch = annGraphEfSearch
+	graph.Rng = rand.New(rand.NewSource(seed))
+	shuffleRNG := rand.New(rand.NewSource(seed))
+	shuffleRNG.Shuffle(len(nodes), func(i, j int) {
+		nodes[i], nodes[j] = nodes[j], nodes[i]
+	})
+	if err := addHNSWNodeChunk(&hnsw.SavedGraph[int64]{Graph: graph}, nodes); err != nil {
+		return nil, fmt.Errorf("add nodes: %w", err)
+	}
+	return graph, nil
 }
 
 func (s *Store) validateANNMetadata(meta annMetadata) error {
@@ -423,13 +493,20 @@ func (s *Store) validateANNMetadata(meta annMetadata) error {
 }
 
 func (s *Store) currentANNMetadata() (annMetadata, error) {
-	rows, err := s.db.Query(`SELECT model, dims FROM embeddings ORDER BY rowid`)
+	args := annEligibilityArgs()
+	rows, err := s.db.Query(`
+		SELECT e.model, e.dims
+		FROM embeddings e
+		JOIN symbols s ON s.id = e.symbol_id
+		WHERE `+annEligibilityWhereSQL("s")+`
+		ORDER BY e.rowid
+	`, args...)
 	if err != nil {
 		return annMetadata{}, fmt.Errorf("query embeddings: %w", err)
 	}
 	defer rows.Close()
 
-	meta := annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW}
+	meta := annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW, M: annGraphM, Ml: annGraphMl, EfSearch: annGraphEfSearch, Seed: annGraphSeed}
 	for rows.Next() {
 		var model string
 		var dims int
@@ -463,23 +540,21 @@ func (s *Store) BuildANNArtifacts() error {
 	if meta.Count == 0 {
 		return fmt.Errorf("build ann artifacts: no embeddings available")
 	}
-	rows, err := s.db.Query(`SELECT rowid, vector FROM embeddings ORDER BY rowid`)
+	nodes, err := s.annAllNodes()
 	if err != nil {
-		return fmt.Errorf("build ann artifacts: query embeddings: %w", err)
+		return fmt.Errorf("build ann artifacts: %w", err)
 	}
-	defer rows.Close()
-
 	graph := hnsw.NewGraph[int64]()
-	for rows.Next() {
-		var rowid int64
-		var blob []byte
-		if err := rows.Scan(&rowid, &blob); err != nil {
-			return fmt.Errorf("build ann artifacts: scan embedding: %w", err)
-		}
-		graph.Add(hnsw.MakeNode(rowid, decodeFloat32s(blob)))
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("build ann artifacts: iterate embeddings: %w", err)
+	graph.M = annGraphM
+	graph.Ml = annGraphMl
+	graph.EfSearch = annGraphEfSearch
+	graph.Rng = rand.New(rand.NewSource(annGraphSeed))
+	shuffleRNG := rand.New(rand.NewSource(annGraphSeed))
+	shuffleRNG.Shuffle(len(nodes), func(i, j int) {
+		nodes[i], nodes[j] = nodes[j], nodes[i]
+	})
+	if err := addHNSWNodes(&hnsw.SavedGraph[int64]{Graph: graph}, nodes); err != nil {
+		return fmt.Errorf("build ann artifacts: add nodes: %w", err)
 	}
 
 	paths := annArtifactPaths(s.path)
@@ -503,25 +578,94 @@ func (s *Store) BuildANNArtifacts() error {
 	return nil
 }
 
+func (s *Store) annAllNodes() ([]hnsw.Node[int64], error) {
+	rows, err := s.db.Query(`
+		SELECT e.rowid, e.vector
+		FROM embeddings e
+		JOIN symbols s ON s.id = e.symbol_id
+		WHERE `+annEligibilityWhereSQL("s")+`
+		ORDER BY e.rowid
+	`, annEligibilityArgs()...)
+	if err != nil {
+		return nil, fmt.Errorf("query embeddings: %w", err)
+	}
+	defer rows.Close()
+	nodes := make([]hnsw.Node[int64], 0)
+	for rows.Next() {
+		var rowid int64
+		var blob []byte
+		if err := rows.Scan(&rowid, &blob); err != nil {
+			return nil, fmt.Errorf("scan embedding: %w", err)
+		}
+		nodes = append(nodes, hnsw.MakeNode(rowid, decodeFloat32s(blob)))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate embeddings: %w", err)
+	}
+	return nodes, nil
+}
+
+func annEligibilityArgs() []any {
+	args := make([]any, 0, 1+len(annExcludedKinds))
+	args = append(args, annTierCutoff)
+	for _, kind := range annExcludedKinds {
+		args = append(args, kind)
+	}
+	return args
+}
+
+func annEligibilityWhereSQL(symbolAlias string) string {
+	if len(annExcludedKinds) == 0 {
+		return symbolAlias + ".source_tier <= ?"
+	}
+	placeholders := strings.Repeat("?,", len(annExcludedKinds))
+	placeholders = placeholders[:len(placeholders)-1]
+	return symbolAlias + ".source_tier <= ? AND " + symbolAlias + ".kind NOT IN (" + placeholders + ")"
+}
+
 func (h *hnswSemanticSearcher) Search(queryVec []float32, limit int) ([]semanticCandidate, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	if h.graph == nil || h.graph.Len() == 0 {
+	if (h.graph == nil || h.graph.Len() == 0) && (h.altGraph == nil || h.altGraph.Len() == 0) {
 		return nil, nil
 	}
-	nodes := h.graph.Search(queryVec, limit)
-	if len(nodes) == 0 {
+	best := make(map[int64]semanticCandidate, limit*2*annSearchPasses)
+	graphs := make([]*hnsw.Graph[int64], 0, 2)
+	if h.graph != nil {
+		graphs = append(graphs, h.graph.Graph)
+	}
+	if h.altGraph != nil {
+		graphs = append(graphs, h.altGraph)
+	}
+	for pass := 0; pass < annSearchPasses; pass++ {
+		for _, graph := range graphs {
+			if graph == nil || graph.Len() == 0 {
+				continue
+			}
+			nodes := graph.Search(queryVec, limit)
+			if len(nodes) == 0 {
+				continue
+			}
+			for _, node := range nodes {
+				candidate := semanticCandidate{
+					rowid: node.Key,
+					score: cosineSimilarity(queryVec, node.Value),
+				}
+				if existing, ok := best[node.Key]; !ok || candidate.score > existing.score {
+					best[node.Key] = candidate
+				}
+			}
+		}
+	}
+	if len(best) == 0 {
 		return nil, nil
 	}
-	out := make([]semanticCandidate, 0, len(nodes))
-	for _, node := range nodes {
-		out = append(out, semanticCandidate{
-			rowid: node.Key,
-			score: cosineSimilarity(queryVec, node.Value),
-		})
+	out := make([]semanticCandidate, 0, len(best))
+	for _, candidate := range best {
+		out = append(out, candidate)
 	}
 	return out, nil
 }
