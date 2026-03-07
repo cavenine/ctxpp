@@ -264,6 +264,28 @@ func TestHandleSearch_HybridFallsBackToKeywordOnEmbedError(t *testing.T) {
 	}
 }
 
+func TestHandleANNStatus_ReturnsANNState(t *testing.T) {
+	root := setupFixture(t)
+	a := testApp(t, root)
+
+	result, err := a.handleANNStatus(context.Background(), makeToolRequest(nil))
+	if err != nil {
+		t.Fatalf("handleANNStatus() error = %v", err)
+	}
+	text := getResultText(t, result)
+
+	var status store.ANNStatus
+	if err := json.Unmarshal([]byte(text), &status); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if status.Mode != store.SemanticModeBruteForce {
+		t.Fatalf("Mode = %q, want %q", status.Mode, store.SemanticModeBruteForce)
+	}
+	if status.State != store.ANNStateDisabled {
+		t.Fatalf("State = %q, want %q", status.State, store.ANNStateDisabled)
+	}
+}
+
 func TestHandleSearch_SemanticMode(t *testing.T) {
 	root := setupFixture(t)
 	a := testApp(t, root)

@@ -26,6 +26,7 @@ ctx++ is built around three principles:
 | `ctxpp_file_skeleton` | Return all symbols in a file with signatures and line ranges, without reading the full body. Cheap way to understand a file's API surface. |
 | `ctxpp_feature_traverse` | Given an exact symbol name, return related symbols by walking the call graph outward via BFS. The auto-generated feature hub. |
 | `ctxpp_blast_radius` | Given a symbol, return every location in the codebase that references it. Answers "what breaks if I change this?" |
+| `ctxpp_ann_status` | Return the current ANN search status, including whether ANN is active, rebuilding, missing, or disabled. |
 
 ---
 
@@ -181,6 +182,10 @@ use ctxpp to find where FetchAccount is defined and what calls it
 use ctxpp_blast_radius to tell me what breaks if I change the Account struct
 ```
 
+```
+use ctxpp_ann_status to check whether ANN search is healthy or rebuilding
+```
+
 ---
 
 ## Ollama Integration
@@ -309,6 +314,7 @@ All configuration is via environment variables.
 | Variable | Default | Description |
 |---|---|---|
 | `CTXPP_PROJECT` | `.` | Path to the project root to index |
+| `CTXPP_VECTOR_INDEX` | `auto` | Vector search engine: `auto`, `bruteforce`, or `ann` |
 | `CTXPP_OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint |
 | `CTXPP_OLLAMA_MODEL` | `bge-m3` | Ollama embedding model |
 | `CTXPP_EMBED_BACKEND` | _(auto-detect)_ | Embedding backend: `ollama` or `bedrock` |

@@ -140,6 +140,21 @@ type OpenOptions struct {
 	SemanticMode SemanticMode
 }
 
+type ANNState string
+
+const (
+	ANNStateDisabled   ANNState = "disabled"
+	ANNStateHealthy    ANNState = "healthy"
+	ANNStateRebuilding ANNState = "rebuilding"
+	ANNStateMissing    ANNState = "missing"
+)
+
+type ANNStatus struct {
+	Mode             SemanticMode
+	State            ANNState
+	ArtifactsPresent bool
+}
+
 var semanticPool = sync.Pool{
 	New: func() any {
 		return &semanticScratch{
@@ -164,17 +179,20 @@ func (sc *semanticScratch) reset(limit int) {
 // just to check SHA hashes while the store writer holds the connection for
 // batch inserts.
 type Store struct {
-	db               *sql.DB // write path: MaxOpenConns=1, _txlock=immediate
-	rdb              *sql.DB // read path: MaxOpenConns=4, read-only queries
-	path             string
-	semanticMode     SemanticMode
-	semanticSearcher semanticSearcher
-	annSyncMu        sync.Mutex
-	annSyncDepth     int
-	annSyncDirty     bool
-	annSyncRebuild   bool
-	annPendingUpsert map[string]struct{}
-	annPendingDelete map[int64]struct{}
+	db                 *sql.DB // write path: MaxOpenConns=1, _txlock=immediate
+	rdb                *sql.DB // read path: MaxOpenConns=4, read-only queries
+	path               string
+	semanticMode       SemanticMode
+	semanticMu         sync.RWMutex
+	semanticSearcher   semanticSearcher
+	annSyncMu          sync.Mutex
+	annSyncDepth       int
+	annSyncDirty       bool
+	annSyncRebuild     bool
+	annPendingUpsert   map[string]struct{}
+	annPendingDelete   map[int64]struct{}
+	annRebuildInFlight bool
+	annRebuildDone     chan struct{}
 }
 
 // Open opens (or creates) a Store at the given file path.
@@ -216,7 +234,9 @@ func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
 	if mode == "" {
 		mode = SemanticModeAuto
 	}
-	st := &Store{db: db, rdb: rdb, path: path, semanticMode: mode}
+	done := make(chan struct{})
+	close(done)
+	st := &Store{db: db, rdb: rdb, path: path, semanticMode: mode, annRebuildDone: done}
 	if err := st.configureSemanticSearcher(); err != nil {
 		rdb.Close()
 		db.Close()
@@ -243,29 +263,83 @@ func (s *Store) configureSemanticSearcher() error {
 	case SemanticModeANN:
 		searcher, err := tryANN()
 		if err != nil {
+			s.semanticMu.Lock()
 			s.semanticSearcher = bruteForce
+			s.semanticMu.Unlock()
 			s.semanticMode = SemanticModeBruteForce
 			return nil
 		}
+		s.semanticMu.Lock()
 		s.semanticSearcher = searcher
+		s.semanticMu.Unlock()
 		return nil
 	case SemanticModeAuto:
 		searcher, err := tryANN()
 		if err == nil {
+			s.semanticMu.Lock()
 			s.semanticSearcher = searcher
+			s.semanticMu.Unlock()
 			s.semanticMode = SemanticModeANN
 			return nil
 		}
+		s.semanticMu.Lock()
 		s.semanticSearcher = bruteForce
+		s.semanticMu.Unlock()
 		s.semanticMode = SemanticModeBruteForce
 		return nil
 	case SemanticModeBruteForce:
+		s.semanticMu.Lock()
 		s.semanticSearcher = bruteForce
+		s.semanticMu.Unlock()
 		s.semanticMode = SemanticModeBruteForce
 		return nil
 	default:
 		return fmt.Errorf("store: unsupported semantic mode %q", s.semanticMode)
 	}
+}
+
+func (s *Store) currentSemanticSearcher() semanticSearcher {
+	s.semanticMu.RLock()
+	defer s.semanticMu.RUnlock()
+	return s.semanticSearcher
+}
+
+func (s *Store) replaceSemanticSearcher(searcher semanticSearcher) {
+	s.semanticMu.Lock()
+	s.semanticSearcher = searcher
+	s.semanticMu.Unlock()
+}
+
+func (s *Store) waitForBackgroundANNRebuild() error {
+	s.annSyncMu.Lock()
+	done := s.annRebuildDone
+	s.annSyncMu.Unlock()
+	<-done
+	return nil
+}
+
+func (s *Store) ANNStatus() ANNStatus {
+	status := ANNStatus{Mode: s.semanticMode}
+	paths := annArtifactPaths(s.path)
+	status.ArtifactsPresent = annArtifactsExist(paths)
+	if s.semanticMode != SemanticModeANN {
+		status.State = ANNStateDisabled
+		return status
+	}
+
+	s.annSyncMu.Lock()
+	rebuilding := s.annRebuildInFlight
+	s.annSyncMu.Unlock()
+	if rebuilding {
+		status.State = ANNStateRebuilding
+		return status
+	}
+	if !status.ArtifactsPresent {
+		status.State = ANNStateMissing
+		return status
+	}
+	status.State = ANNStateHealthy
+	return status
 }
 
 // Close closes both the write and read database connections.
@@ -546,7 +620,8 @@ func (s *Store) SearchSemantic(queryVec []float32, limit int) ([]types.Symbol, e
 	if limit <= 0 {
 		limit = 10
 	}
-	candidates, err := s.semanticSearcher.Search(queryVec, limit*3)
+	searcher := s.currentSemanticSearcher()
+	candidates, err := searcher.Search(queryVec, limit*3)
 	if err != nil {
 		return nil, err
 	}

@@ -344,6 +344,13 @@ The current ANN integration now supports deferred artifact refresh during write-
 
 This keeps correctness the same while reducing rebuild churn in hot paths.
 
+The current prototype also supports background rebuild-and-swap for active ANN stores:
+
+- mutating operations can schedule a background ANN rebuild instead of blocking on a full artifact refresh
+- ctx++ keeps serving from the last known-good ANN graph while rebuild is in flight
+- on success, the store swaps to the fresh ANN searcher atomically
+- on failure, ctx++ keeps the old ANN graph and can retry later
+
 ---
 
 ## Testing Plan

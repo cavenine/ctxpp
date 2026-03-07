@@ -69,7 +69,12 @@ func runBackfill(path string) {
 	root, _ = filepath.Abs(root)
 
 	dbDir := filepath.Join(root, ".ctxpp")
-	st, err := store.Open(filepath.Join(dbDir, "index.db"))
+	storeOpts, err := parseStoreOpenOptionsFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse store options: %v\n", err)
+		os.Exit(1)
+	}
+	st, err := store.OpenWithOptions(filepath.Join(dbDir, "index.db"), storeOpts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		os.Exit(1)

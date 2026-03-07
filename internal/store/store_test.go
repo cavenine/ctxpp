@@ -1309,6 +1309,187 @@ func TestDeferredANNSync_FlushesIncrementalDeletesAndUpserts(t *testing.T) {
 	}
 }
 
+func TestDeleteFile_SchedulesBackgroundANNRebuildAndSwapsArtifacts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	seedStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, seedStore,
+		types.FileRecord{Path: "keep.go", SHA256: "a", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "keep.go:Keep:function", File: "keep.go", Name: "Keep", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	seedFile(t, seedStore,
+		types.FileRecord{Path: "drop.go", SHA256: "b", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "drop.go:Drop:function", File: "drop.go", Name: "Drop", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	if err := seedStore.UpsertEmbedding("keep.go:Keep:function", "bg-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(keep) error = %v", err)
+	}
+	if err := seedStore.UpsertEmbedding("drop.go:Drop:function", "bg-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(drop) error = %v", err)
+	}
+	if err := seedStore.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	storeANN := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	origHook := annBackgroundRebuildHook
+	t.Cleanup(func() { annBackgroundRebuildHook = origHook })
+	annBackgroundRebuildHook = func() {
+		close(started)
+		<-release
+	}
+
+	if err := storeANN.DeleteFile("drop.go"); err != nil {
+		t.Fatalf("DeleteFile() error = %v", err)
+	}
+	<-started
+
+	meta, err := readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Count != 2 {
+		t.Fatalf("Count before swap = %d, want 2", meta.Count)
+	}
+
+	close(release)
+	if err := storeANN.waitForBackgroundANNRebuild(); err != nil {
+		t.Fatalf("waitForBackgroundANNRebuild() error = %v", err)
+	}
+
+	meta, err = readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() after swap error = %v", err)
+	}
+	if meta.Count != 1 {
+		t.Fatalf("Count after swap = %d, want 1", meta.Count)
+	}
+	got, err := storeANN.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "Keep" {
+		t.Fatalf("SearchSemantic() = %+v, want only Keep", got)
+	}
+}
+
+func TestUpsertEmbedding_SchedulesBackgroundANNRebuildWhenMetadataDrifts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	seedStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, seedStore,
+		types.FileRecord{Path: "swap.go", SHA256: "a", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "swap.go:Old:function", File: "swap.go", Name: "Old", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "swap.go:Fresh:function", File: "swap.go", Name: "Fresh", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+	if err := seedStore.UpsertEmbedding("swap.go:Old:function", "bg-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(old) error = %v", err)
+	}
+	if err := seedStore.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	storeANN := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	origHook := annBackgroundRebuildHook
+	t.Cleanup(func() { annBackgroundRebuildHook = origHook })
+	annBackgroundRebuildHook = func() {
+		close(started)
+		<-release
+	}
+
+	if err := storeANN.UpsertEmbedding("swap.go:Fresh:function", "bg-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(fresh) error = %v", err)
+	}
+	<-started
+
+	meta, err := readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Count != 1 {
+		t.Fatalf("Count before swap = %d, want 1", meta.Count)
+	}
+
+	close(release)
+	if err := storeANN.waitForBackgroundANNRebuild(); err != nil {
+		t.Fatalf("waitForBackgroundANNRebuild() error = %v", err)
+	}
+
+	meta, err = readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() after swap error = %v", err)
+	}
+	if meta.Count != 2 {
+		t.Fatalf("Count after swap = %d, want 2", meta.Count)
+	}
+	got, err := storeANN.SearchSemantic([]float32{1, 0, 0}, 3)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchSemantic() returned %d results, want 2", len(got))
+	}
+}
+
+func TestANNStatus_ReportsHealthyRebuildingAndBruteForce(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	seedStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, seedStore,
+		types.FileRecord{Path: "status.go", SHA256: "a", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "status.go:One:function", File: "status.go", Name: "One", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	if err := seedStore.UpsertEmbedding("status.go:One:function", "status-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding() error = %v", err)
+	}
+	if err := seedStore.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	brute := openTestStoreAtPath(t, filepath.Join(t.TempDir(), ".ctxpp-brute", "index.db"), OpenOptions{SemanticMode: SemanticModeBruteForce})
+	if got := brute.ANNStatus(); got.Mode != SemanticModeBruteForce || got.State != ANNStateDisabled {
+		t.Fatalf("bruteforce ANNStatus() = %+v, want bruteforce/disabled", got)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	if got := annStore.ANNStatus(); got.Mode != SemanticModeANN || got.State != ANNStateHealthy || !got.ArtifactsPresent {
+		t.Fatalf("healthy ANNStatus() = %+v, want ann/healthy with artifacts", got)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	origHook := annBackgroundRebuildHook
+	t.Cleanup(func() { annBackgroundRebuildHook = origHook })
+	annBackgroundRebuildHook = func() {
+		close(started)
+		<-release
+	}
+
+	seedFile(t, annStore,
+		types.FileRecord{Path: "status.go", SHA256: "b", ModTime: 2, Lang: "go"},
+		[]types.Symbol{{ID: "status.go:Two:function", File: "status.go", Name: "Two", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	if err := annStore.UpsertEmbedding("status.go:Two:function", "status-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding() error = %v", err)
+	}
+	<-started
+
+	if got := annStore.ANNStatus(); got.Mode != SemanticModeANN || got.State != ANNStateRebuilding || !got.ArtifactsPresent {
+		t.Fatalf("rebuilding ANNStatus() = %+v, want ann/rebuilding with artifacts", got)
+	}
+
+	close(release)
+	if err := annStore.waitForBackgroundANNRebuild(); err != nil {
+		t.Fatalf("waitForBackgroundANNRebuild() error = %v", err)
+	}
+	if got := annStore.ANNStatus(); got.Mode != SemanticModeANN || got.State != ANNStateHealthy {
+		t.Fatalf("post-rebuild ANNStatus() = %+v, want ann/healthy", got)
+	}
+}
+
 func TestUpsertParsedFile_RebuildsExistingANNArtifacts(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
 	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})

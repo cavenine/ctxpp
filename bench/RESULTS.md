@@ -104,6 +104,34 @@ pie title Symbol Distribution by Tier (kubernetes, ctx++)
 
 † ctx++ search latency includes per-query Ollama embedding (~25 ms) plus brute-force cosine scan over 318K vectors (~615 ms). codemogger's keyword mode does not scan all vectors. With a warm SQLite cache, ctx++ semantic-only search is ~3.5 ms p50.
 
+### ANN follow-up on the same Kubernetes index
+
+After the HNSW ANN prototype landed, the same Kubernetes index at `317,983` embeddings was re-measured without reindexing from source. The existing SQLite index at `/tmp/bench-k8s-ctxpp/.ctxpp/index.db` was reused.
+
+| Metric | ctx++ brute-force | ctx++ ANN |
+|--------|-------------------|-----------|
+| Embed avg | 26.1 ms | 25.3 ms |
+| Search avg | 732.7 ms | 714 µs |
+| Search p50 | 696.9 ms | 692 µs |
+| End-to-end semantic query (embed + search) | ~759 ms | ~26 ms |
+
+This is roughly a **29x improvement** in end-to-end semantic query latency on Kubernetes, and about a **1000x improvement** in the vector-search portion itself.
+
+ANN artifact build/open timing on that same index:
+
+| Metric | Time |
+|--------|------|
+| First ANN open/build from existing SQLite index | 40.8 s |
+| Warm ANN open with artifacts already present | 2.72 s |
+
+Projected impact on the original Kubernetes full index benchmark:
+
+- original full ctx++ index: `47m 14s`
+- ANN artifact build overhead on the completed index: `~41s`
+- projected full eager index with ANN enabled: `~47m 55s`
+
+That is roughly a **1.4% increase** in full indexing time in exchange for the much lower semantic query latency above.
+
 ‡ Context+ builds embeddings lazily on the first search call rather than eagerly at index time. The 2m 7s figure is the wall-clock time for that first `semantic_code_search` invocation to return — it is not a full corpus index. ctx++ and codemogger fully embed the entire corpus before any search is issued; Context+ does not. The figure is not directly comparable to the other two index times.
 
 ```mermaid

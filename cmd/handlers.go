@@ -189,3 +189,9 @@ func (a *app) handleBlastRadius(_ context.Context, req mcp.CallToolRequest) (*mc
 	out, _ := json.MarshalIndent(blastResult{Symbol: symbol, Callers: callerSyms}, "", "  ")
 	return mcp.NewToolResultText(string(out)), nil
 }
+
+func (a *app) handleANNStatus(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	status := a.store.ANNStatus()
+	out, _ := json.MarshalIndent(status, "", "  ")
+	return mcp.NewToolResultText(string(out)), nil
+}

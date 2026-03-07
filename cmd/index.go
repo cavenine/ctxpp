@@ -63,7 +63,12 @@ func runIndex(path string, force bool) {
 		slog.Error("mkdir .ctxpp", "err", err)
 		os.Exit(1)
 	}
-	st, err := store.Open(filepath.Join(dbDir, "index.db"))
+	storeOpts, err := parseStoreOpenOptionsFromEnv()
+	if err != nil {
+		slog.Error("parse store options", "err", err)
+		os.Exit(1)
+	}
+	st, err := store.OpenWithOptions(filepath.Join(dbDir, "index.db"), storeOpts)
 	if err != nil {
 		slog.Error("open store", "err", err)
 		os.Exit(1)

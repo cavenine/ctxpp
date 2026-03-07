@@ -6,9 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/coder/hnsw"
 )
+
+var annBackgroundRebuildHook func()
 
 const (
 	annFormatVersion = 1
@@ -31,6 +34,7 @@ type annMetadata struct {
 type hnswSemanticSearcher struct {
 	paths    annPaths
 	metadata annMetadata
+	mu       sync.RWMutex
 	graph    *hnsw.SavedGraph[int64]
 }
 
@@ -84,7 +88,49 @@ func (s *Store) syncANNArtifactsIfPresent() error {
 		return nil
 	}
 	s.annSyncMu.Unlock()
+	return s.syncANNArtifactsMaybeAsync()
+}
+
+func (s *Store) syncANNArtifactsMaybeAsync() error {
+	if s.semanticMode == SemanticModeANN {
+		if _, ok := s.currentSemanticSearcher().(*hnswSemanticSearcher); ok {
+			s.scheduleBackgroundANNRebuild()
+			return nil
+		}
+	}
 	return s.forceSyncANNArtifactsIfPresent()
+}
+
+func (s *Store) scheduleBackgroundANNRebuild() {
+	s.annSyncMu.Lock()
+	if s.annRebuildInFlight {
+		s.annSyncMu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	s.annRebuildInFlight = true
+	s.annRebuildDone = done
+	s.annSyncMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.annSyncMu.Lock()
+			s.annRebuildInFlight = false
+			close(done)
+			s.annSyncMu.Unlock()
+		}()
+		if annBackgroundRebuildHook != nil {
+			annBackgroundRebuildHook()
+		}
+		if err := s.BuildANNArtifacts(); err != nil {
+			return
+		}
+		searcher, err := newHNSWSemanticSearcher(s)
+		if err != nil {
+			return
+		}
+		s.replaceSemanticSearcher(searcher)
+	}()
 }
 
 func (s *Store) forceSyncANNArtifactsIfPresent() error {
@@ -143,14 +189,14 @@ func (s *Store) syncANNEmbeddingUpsertsIfPresent(symbolIDs []string) error {
 	}
 	stored, err := readANNMetadata(paths.Metadata)
 	if err != nil {
-		return s.BuildANNArtifacts()
+		return s.syncANNArtifactsMaybeAsync()
 	}
 	if stored.FormatVersion != annFormatVersion || stored.Engine != annEngineHNSW || stored.Model != current.Model || stored.Dims != current.Dims || current.Count < stored.Count {
-		return s.BuildANNArtifacts()
+		return s.syncANNArtifactsMaybeAsync()
 	}
 	graph, err := hnsw.LoadSavedGraph[int64](paths.Index)
 	if err != nil {
-		return s.BuildANNArtifacts()
+		return s.syncANNArtifactsMaybeAsync()
 	}
 	nodes, err := s.annNodesBySymbolIDs(symbolIDs)
 	if err != nil {
@@ -160,7 +206,7 @@ func (s *Store) syncANNEmbeddingUpsertsIfPresent(symbolIDs []string) error {
 		return nil
 	}
 	if err := addHNSWNodes(graph, nodes); err != nil {
-		return s.BuildANNArtifacts()
+		return s.syncANNArtifactsMaybeAsync()
 	}
 	if err := graph.Save(); err != nil {
 		return fmt.Errorf("sync ann embedding upserts: save graph: %w", err)
@@ -205,14 +251,14 @@ func (s *Store) syncANNEmbeddingDeletesIfPresent(rowIDs []int64) error {
 	}
 	stored, err := readANNMetadata(paths.Metadata)
 	if err != nil {
-		return s.BuildANNArtifacts()
+		return s.syncANNArtifactsMaybeAsync()
 	}
 	if stored.FormatVersion != annFormatVersion || stored.Engine != annEngineHNSW || stored.Model != current.Model || stored.Dims != current.Dims || current.Count > stored.Count {
-		return s.BuildANNArtifacts()
+		return s.syncANNArtifactsMaybeAsync()
 	}
 	graph, err := hnsw.LoadSavedGraph[int64](paths.Index)
 	if err != nil {
-		return s.BuildANNArtifacts()
+		return s.syncANNArtifactsMaybeAsync()
 	}
 	for _, rowID := range rowIDs {
 		graph.Delete(rowID)
@@ -461,6 +507,8 @@ func (h *hnswSemanticSearcher) Search(queryVec []float32, limit int) ([]semantic
 	if limit <= 0 {
 		limit = 10
 	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	if h.graph == nil || h.graph.Len() == 0 {
 		return nil, nil
 	}

@@ -65,7 +65,12 @@ func runMCP() {
 		slog.SetDefault(slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	}
 
-	st, err := store.Open(filepath.Join(dbDir, "index.db"))
+	storeOpts, err := parseStoreOpenOptionsFromEnv()
+	if err != nil {
+		slog.Error("parse store options", "err", err)
+		os.Exit(1)
+	}
+	st, err := store.OpenWithOptions(filepath.Join(dbDir, "index.db"), storeOpts)
 	if err != nil {
 		slog.Error("open store", "err", err)
 		os.Exit(1)
@@ -151,6 +156,10 @@ func runMCP() {
 			mcp.Description("The symbol name to find references for (e.g. 'FetchAccount')."),
 		),
 	), a.handleBlastRadius)
+
+	s.AddTool(mcp.NewTool("ctxpp_ann_status",
+		mcp.WithDescription("Return the current ANN search status including mode, artifact presence, and whether ANN is healthy or rebuilding."),
+	), a.handleANNStatus)
 
 	// Start background watcher (non-blocking; errors are logged).
 	watchCtx, cancelWatch := context.WithCancel(ctx)
