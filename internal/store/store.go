@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -117,6 +119,27 @@ type semanticHit struct {
 	score float32
 }
 
+type semanticCandidate struct {
+	rowid int64
+	score float32
+}
+
+type semanticSearcher interface {
+	Search(queryVec []float32, limit int) ([]semanticCandidate, error)
+}
+
+type SemanticMode string
+
+const (
+	SemanticModeAuto       SemanticMode = "auto"
+	SemanticModeBruteForce SemanticMode = "bruteforce"
+	SemanticModeANN        SemanticMode = "ann"
+)
+
+type OpenOptions struct {
+	SemanticMode SemanticMode
+}
+
 var semanticPool = sync.Pool{
 	New: func() any {
 		return &semanticScratch{
@@ -124,6 +147,8 @@ var semanticPool = sync.Pool{
 		}
 	},
 }
+
+var newANNSemanticSearcher = newHNSWSemanticSearcher
 
 func (sc *semanticScratch) reset(limit int) {
 	sc.topK = sc.topK[:0]
@@ -139,12 +164,30 @@ func (sc *semanticScratch) reset(limit int) {
 // just to check SHA hashes while the store writer holds the connection for
 // batch inserts.
 type Store struct {
-	db  *sql.DB // write path: MaxOpenConns=1, _txlock=immediate
-	rdb *sql.DB // read path: MaxOpenConns=4, read-only queries
+	db               *sql.DB // write path: MaxOpenConns=1, _txlock=immediate
+	rdb              *sql.DB // read path: MaxOpenConns=4, read-only queries
+	path             string
+	semanticMode     SemanticMode
+	semanticSearcher semanticSearcher
+	annSyncMu        sync.Mutex
+	annSyncDepth     int
+	annSyncDirty     bool
+	annSyncRebuild   bool
+	annPendingUpsert map[string]struct{}
+	annPendingDelete map[int64]struct{}
 }
 
 // Open opens (or creates) a Store at the given file path.
 func Open(path string) (*Store, error) {
+	return OpenWithOptions(path, OpenOptions{})
+}
+
+// OpenWithOptions opens (or creates) a Store at the given file path with
+// optional semantic search configuration.
+func OpenWithOptions(path string, opts OpenOptions) (*Store, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("store: create db dir: %w", err)
+	}
 	// Write connection: single writer with immediate transaction locking.
 	db, err := sql.Open("sqlite", path+"?_busy_timeout=5000&_txlock=immediate")
 	if err != nil {
@@ -169,7 +212,60 @@ func Open(path string) (*Store, error) {
 	}
 	rdb.SetMaxOpenConns(4) // enough for parse workers to not block each other
 
-	return &Store{db: db, rdb: rdb}, nil
+	mode := opts.SemanticMode
+	if mode == "" {
+		mode = SemanticModeAuto
+	}
+	st := &Store{db: db, rdb: rdb, path: path, semanticMode: mode}
+	if err := st.configureSemanticSearcher(); err != nil {
+		rdb.Close()
+		db.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
+func (s *Store) configureSemanticSearcher() error {
+	bruteForce := &bruteForceSemanticSearcher{store: s}
+	tryANN := func() (semanticSearcher, error) {
+		searcher, err := newANNSemanticSearcher(s)
+		if err != nil {
+			if buildErr := s.BuildANNArtifacts(); buildErr == nil {
+				searcher, err = newANNSemanticSearcher(s)
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		return searcher, nil
+	}
+	switch s.semanticMode {
+	case SemanticModeANN:
+		searcher, err := tryANN()
+		if err != nil {
+			s.semanticSearcher = bruteForce
+			s.semanticMode = SemanticModeBruteForce
+			return nil
+		}
+		s.semanticSearcher = searcher
+		return nil
+	case SemanticModeAuto:
+		searcher, err := tryANN()
+		if err == nil {
+			s.semanticSearcher = searcher
+			s.semanticMode = SemanticModeANN
+			return nil
+		}
+		s.semanticSearcher = bruteForce
+		s.semanticMode = SemanticModeBruteForce
+		return nil
+	case SemanticModeBruteForce:
+		s.semanticSearcher = bruteForce
+		s.semanticMode = SemanticModeBruteForce
+		return nil
+	default:
+		return fmt.Errorf("store: unsupported semantic mode %q", s.semanticMode)
+	}
 }
 
 // Close closes both the write and read database connections.
@@ -184,6 +280,49 @@ func (s *Store) Close() error {
 
 // DB exposes the raw *sql.DB for advanced use.
 func (s *Store) DB() *sql.DB { return s.db }
+
+// BeginDeferredANNSync defers ANN artifact refreshes until EndDeferredANNSync is
+// called. Nested calls are supported.
+func (s *Store) BeginDeferredANNSync() {
+	s.annSyncMu.Lock()
+	s.annSyncDepth++
+	s.annSyncMu.Unlock()
+}
+
+// EndDeferredANNSync ends a deferred ANN sync scope and flushes one pending
+// artifact refresh if needed when the outermost scope exits.
+func (s *Store) EndDeferredANNSync() error {
+	s.annSyncMu.Lock()
+	if s.annSyncDepth == 0 {
+		s.annSyncMu.Unlock()
+		return fmt.Errorf("store: deferred ann sync underflow")
+	}
+	s.annSyncDepth--
+	shouldSync := s.annSyncDepth == 0 && s.annSyncDirty
+	rebuild := s.annSyncRebuild
+	upserts := make([]string, 0, len(s.annPendingUpsert))
+	for symbolID := range s.annPendingUpsert {
+		upserts = append(upserts, symbolID)
+	}
+	deletes := make([]int64, 0, len(s.annPendingDelete))
+	for rowID := range s.annPendingDelete {
+		deletes = append(deletes, rowID)
+	}
+	if shouldSync {
+		s.annSyncDirty = false
+		s.annSyncRebuild = false
+		s.annPendingUpsert = nil
+		s.annPendingDelete = nil
+	}
+	s.annSyncMu.Unlock()
+	if !shouldSync {
+		return nil
+	}
+	if err := s.flushDeferredANNSync(rebuild, upserts, deletes); err != nil {
+		return fmt.Errorf("flush deferred ann sync: %w", err)
+	}
+	return nil
+}
 
 // ---- Files ----------------------------------------------------------------
 
@@ -210,7 +349,13 @@ func (s *Store) UpsertFile(f types.FileRecord) error {
 // DeleteFile removes a file and all its symbols (via CASCADE).
 func (s *Store) DeleteFile(path string) error {
 	_, err := s.db.Exec(`DELETE FROM files WHERE path=?`, path)
-	return err
+	if err != nil {
+		return err
+	}
+	if err := s.syncANNArtifactsIfPresent(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ListFiles returns all indexed file paths.
@@ -240,7 +385,13 @@ func (s *Store) ListFiles() ([]string, error) {
 // DeleteSymbolsByFile removes all symbols for a file before re-inserting.
 func (s *Store) DeleteSymbolsByFile(filePath string) error {
 	_, err := s.db.Exec(`DELETE FROM symbols WHERE file=?`, filePath)
-	return err
+	if err != nil {
+		return err
+	}
+	if err := s.syncANNArtifactsIfPresent(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // UpsertSymbol inserts or replaces a symbol.
@@ -312,7 +463,13 @@ func (s *Store) UpsertEmbedding(symbolID, model string, vec []float32) error {
 		INSERT INTO embeddings(symbol_id,model,dims,vector) VALUES(?,?,?,?)
 		ON CONFLICT(symbol_id) DO UPDATE SET model=excluded.model, dims=excluded.dims, vector=excluded.vector`,
 		symbolID, model, len(vec), blob)
-	return err
+	if err != nil {
+		return err
+	}
+	if err := s.syncANNArtifactsIfPresent(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // EmbeddingItem groups the fields needed for a single embedding upsert.
@@ -345,7 +502,17 @@ func (s *Store) UpsertEmbeddingsBatch(items []EmbeddingItem) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	symbolIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		symbolIDs = append(symbolIDs, item.SymbolID)
+	}
+	if err := s.syncANNEmbeddingUpsertsIfPresent(symbolIDs); err != nil {
+		return err
+	}
+	return nil
 }
 
 // deduplicateByNameKind removes duplicate symbols that share the same Name and
@@ -366,36 +533,53 @@ func deduplicateByNameKind(syms []types.Symbol) []types.Symbol {
 	return out
 }
 
-// SearchSemantic performs cosine similarity search by comparing query vector against all stored embeddings.
-// This is a brute-force scan; adequate for codebases up to ~100k symbols.
+type bruteForceSemanticSearcher struct {
+	store *Store
+}
+
+// SearchSemantic performs cosine similarity search using the configured
+// semantic searcher, then applies the existing exact ranking pipeline:
+// source-tier weighting, symbol hydration, and deduplication. The default
+// searcher is a brute-force scan, but this orchestration layer is the seam for
+// future ANN candidate generation.
+func (s *Store) SearchSemantic(queryVec []float32, limit int) ([]types.Symbol, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	candidates, err := s.semanticSearcher.Search(queryVec, limit*3)
+	if err != nil {
+		return nil, err
+	}
+	return s.hydrateSemanticCandidates(queryVec, candidates, limit)
+}
+
+// Search performs brute-force cosine similarity search by comparing query
+// vectors against all stored embeddings. It returns candidate row IDs and raw
+// cosine scores only; Store.SearchSemantic handles the higher-level ranking and
+// hydration steps.
 //
 // Two-phase approach to minimise allocations:
 //
 //	Phase 1: scan only (rowid, vector blob) using RawBytes and integer rowid
 //	         to avoid per-row string and blob-copy allocations. Compute cosine
-//	         similarity and track top-K rowids. We over-select by 3x to allow
-//	         tier-weight adjustments in phase 2.
-//	Phase 2: batch-fetch symbol_id and source_tier for the top-K rowids,
-//	         apply tier weight multipliers, re-sort, and fetch full symbols
-//	         for the final top-limit results.
+//	         similarity and track top-K rowids.
+//	Phase 2: caller applies source-tier weighting, symbol hydration, and final
+//	         limit trimming.
 //
 // All scratch slices and maps are obtained from a sync.Pool (semanticPool) to
 // eliminate per-query allocations on the hot path.
-func (s *Store) SearchSemantic(queryVec []float32, limit int) ([]types.Symbol, error) {
+func (b *bruteForceSemanticSearcher) Search(queryVec []float32, limit int) ([]semanticCandidate, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 
-	// Over-select candidates so tier penalties can displace lower-quality items.
-	candidateLimit := limit * 3
-
 	sc := semanticPool.Get().(*semanticScratch)
 	defer semanticPool.Put(sc)
-	sc.reset(candidateLimit)
+	sc.reset(limit)
 
 	// Phase 1: scan embeddings by rowid (int64, no string alloc) and vector
 	// (RawBytes, avoids bytes.Clone). We only keep the top candidates.
-	rows, err := s.rdb.Query(`SELECT rowid, vector FROM embeddings`)
+	rows, err := b.store.rdb.Query(`SELECT rowid, vector FROM embeddings`)
 	if err != nil {
 		return nil, err
 	}
@@ -412,7 +596,7 @@ func (s *Store) SearchSemantic(queryVec []float32, limit int) ([]types.Symbol, e
 
 		score := cosineSimilarityBlob(queryVec, []byte(blob))
 
-		if len(sc.topK) < candidateLimit {
+		if len(sc.topK) < limit {
 			sc.topK = append(sc.topK, semanticHit{rid, score})
 			if score < sc.topK[minIdx].score {
 				minIdx = len(sc.topK) - 1
@@ -436,6 +620,28 @@ func (s *Store) SearchSemantic(queryVec []float32, limit int) ([]types.Symbol, e
 		return nil, nil
 	}
 
+	out := make([]semanticCandidate, len(sc.topK))
+	for i, hit := range sc.topK {
+		out[i] = semanticCandidate{rowid: hit.rowid, score: hit.score}
+	}
+	return out, nil
+}
+
+func (s *Store) hydrateSemanticCandidates(queryVec []float32, candidates []semanticCandidate, limit int) ([]types.Symbol, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	sc := semanticPool.Get().(*semanticScratch)
+	defer semanticPool.Put(sc)
+	sc.reset(len(candidates))
+	for _, candidate := range candidates {
+		sc.topK = append(sc.topK, semanticHit{rowid: candidate.rowid, score: candidate.score})
+	}
+
 	// Phase 2: look up symbol_id and source_tier for each candidate rowid.
 	placeholders := strings.Repeat("?,", len(sc.topK))
 	placeholders = placeholders[:len(placeholders)-1]
@@ -451,9 +657,11 @@ func (s *Store) SearchSemantic(queryVec []float32, limit int) ([]types.Symbol, e
 		sc.ids = append(sc.ids, "")
 	}
 
-	// Fetch symbol_id and source_tier in one join to avoid an extra round trip.
+	// Fetch symbol_id, source_tier, and vector in one join so candidate scores can
+	// be re-ranked using exact cosine similarity even when the underlying searcher
+	// is approximate.
 	idRows, err := s.rdb.Query(`
-		SELECT e.rowid, e.symbol_id, s.source_tier
+		SELECT e.rowid, e.symbol_id, s.source_tier, e.vector
 		FROM embeddings e
 		JOIN symbols s ON s.id = e.symbol_id
 		WHERE e.rowid IN (`+placeholders+`)`, sc.args...)
@@ -465,13 +673,13 @@ func (s *Store) SearchSemantic(queryVec []float32, limit int) ([]types.Symbol, e
 		var rid int64
 		var sid string
 		var tier types.SourceTier
-		if err := idRows.Scan(&rid, &sid, &tier); err != nil {
+		var blob sql.RawBytes
+		if err := idRows.Scan(&rid, &sid, &tier, &blob); err != nil {
 			return nil, err
 		}
 		if idx, ok := sc.order[rid]; ok {
 			sc.ids[idx] = sid
-			// Apply tier weight to the raw cosine score.
-			sc.topK[idx].score *= tier.TierWeight()
+			sc.topK[idx].score = cosineSimilarityBlob(queryVec, []byte(blob)) * tier.TierWeight()
 		}
 	}
 	if err := idRows.Err(); err != nil {
@@ -569,7 +777,13 @@ func (s *Store) UpsertCallEdges(filePath string, edges []types.CallEdge) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if err := s.syncANNArtifactsIfPresent(); err != nil {
+		return fmt.Errorf("sync ann artifacts: %w", err)
+	}
+	return nil
 }
 
 // Callees returns symbols called by the given symbol.
@@ -611,7 +825,13 @@ func (s *Store) UpsertImportEdges(filePath string, edges []types.ImportEdge) err
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if err := s.syncANNArtifactsIfPresent(); err != nil {
+		return fmt.Errorf("sync ann artifacts: %w", err)
+	}
+	return nil
 }
 
 // ---- Scanning helpers ------------------------------------------------------
@@ -771,7 +991,10 @@ func (s *Store) UpsertParsedFile(pf ParsedFileData) error {
 		return fmt.Errorf("upsert file: %w", err)
 	}
 
-	// 2. Delete stale symbols for this file.
+	// 2. Delete stale embeddings and symbols for this file.
+	if _, err := tx.Exec(`DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE file=?)`, pf.File.Path); err != nil {
+		return fmt.Errorf("delete embeddings: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM symbols WHERE file=?`, pf.File.Path); err != nil {
 		return fmt.Errorf("delete symbols: %w", err)
 	}
@@ -825,7 +1048,13 @@ func (s *Store) UpsertParsedFile(pf ParsedFileData) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if err := s.syncANNArtifactsIfPresent(); err != nil {
+		return fmt.Errorf("sync ann artifacts: %w", err)
+	}
+	return nil
 }
 
 // UpsertParsedFileBatch persists multiple parsed files in a single transaction.
@@ -864,7 +1093,10 @@ func (s *Store) UpsertParsedFileBatch(files []ParsedFileData) error {
 			return fmt.Errorf("upsert file %s: %w", pf.File.Path, err)
 		}
 
-		// 2. Delete stale symbols.
+		// 2. Delete stale embeddings and symbols.
+		if _, err := tx.Exec(`DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE file=?)`, pf.File.Path); err != nil {
+			return fmt.Errorf("delete embeddings %s: %w", pf.File.Path, err)
+		}
 		if _, err := tx.Exec(`DELETE FROM symbols WHERE file=?`, pf.File.Path); err != nil {
 			return fmt.Errorf("delete symbols %s: %w", pf.File.Path, err)
 		}
@@ -904,7 +1136,13 @@ func (s *Store) UpsertParsedFileBatch(files []ParsedFileData) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if err := s.syncANNArtifactsIfPresent(); err != nil {
+		return fmt.Errorf("sync ann artifacts: %w", err)
+	}
+	return nil
 }
 
 // UpsertSymbolsBatch inserts/replaces multiple symbols in a single transaction.

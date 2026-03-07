@@ -1,18 +1,55 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
 
 	"github.com/cavenine/ctxpp/internal/types"
+	"github.com/coder/hnsw"
 )
+
+type stubSemanticSearcher struct {
+	candidates []semanticCandidate
+	err        error
+}
+
+func (s stubSemanticSearcher) Search(_ []float32, _ int) ([]semanticCandidate, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.candidates, nil
+}
 
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+func openTestStoreWithOptions(t *testing.T, opts OpenOptions) *Store {
+	t.Helper()
+	st, err := OpenWithOptions(filepath.Join(t.TempDir(), ".ctxpp", "index.db"), opts)
+	if err != nil {
+		t.Fatalf("OpenWithOptions() error = %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+func openTestStoreAtPath(t *testing.T, dbPath string, opts OpenOptions) *Store {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	st, err := OpenWithOptions(dbPath, opts)
+	if err != nil {
+		t.Fatalf("OpenWithOptions() error = %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
@@ -65,6 +102,16 @@ func seedBenchSymbols(b *testing.B, st *Store, n, dims int) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func openBenchStoreWithOptions(b *testing.B, opts OpenOptions) *Store {
+	b.Helper()
+	st, err := OpenWithOptions(filepath.Join(b.TempDir(), ".ctxpp", "bench.db"), opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = st.Close() })
+	return st
 }
 
 func BenchmarkSearchKeyword_200(b *testing.B) {
@@ -126,6 +173,204 @@ func BenchmarkSearchSemantic_10k(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		_, _ = st.SearchSemantic(query, 10)
+	}
+}
+
+func BenchmarkSearchSemanticANN_10k(b *testing.B) {
+	dbPath := filepath.Join(b.TempDir(), ".ctxpp", "bench.db")
+	st, err := OpenWithOptions(dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer st.Close()
+	const dims = 768
+	seedBenchSymbols(b, st, 10_000, dims)
+	if err := st.BuildANNArtifacts(); err != nil {
+		b.Fatal(err)
+	}
+
+	annStore, err := OpenWithOptions(dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer annStore.Close()
+
+	query := make([]float32, dims)
+	for i := range query {
+		query[i] = 0.5
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = annStore.SearchSemantic(query, 10)
+	}
+}
+
+func BenchmarkBuildANNArtifacts_10k(b *testing.B) {
+	st := openBenchStoreWithOptions(b, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	const dims = 768
+	seedBenchSymbols(b, st, 10_000, dims)
+	b.ResetTimer()
+	for b.Loop() {
+		if err := st.BuildANNArtifacts(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSearchSemantic_100k(b *testing.B) {
+	st, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer st.Close()
+	const dims = 768
+	seedBenchSymbols(b, st, 100_000, dims)
+	query := make([]float32, dims)
+	for i := range query {
+		query[i] = 0.5
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = st.SearchSemantic(query, 10)
+	}
+}
+
+func BenchmarkSearchSemanticANN_100k(b *testing.B) {
+	dbPath := filepath.Join(b.TempDir(), ".ctxpp", "bench.db")
+	st, err := OpenWithOptions(dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer st.Close()
+	const dims = 768
+	seedBenchSymbols(b, st, 100_000, dims)
+	if err := st.BuildANNArtifacts(); err != nil {
+		b.Fatal(err)
+	}
+
+	annStore, err := OpenWithOptions(dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer annStore.Close()
+
+	query := make([]float32, dims)
+	for i := range query {
+		query[i] = 0.5
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = annStore.SearchSemantic(query, 10)
+	}
+}
+
+func BenchmarkBuildANNArtifacts_100k(b *testing.B) {
+	st := openBenchStoreWithOptions(b, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	const dims = 768
+	seedBenchSymbols(b, st, 100_000, dims)
+	b.ResetTimer()
+	for b.Loop() {
+		if err := st.BuildANNArtifacts(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkUpsertEmbeddingsBatchWithDeferredANNSync_10k(b *testing.B) {
+	const (
+		dims      = 768
+		total     = 10_000
+		batchSize = 64
+	)
+
+	makeItems := func() []EmbeddingItem {
+		items := make([]EmbeddingItem, 0, total)
+		for i := 0; i < total; i++ {
+			vec := make([]float32, dims)
+			for j := range vec {
+				vec[j] = float32(i+j) / 1000
+			}
+			items = append(items, EmbeddingItem{
+				SymbolID: "bench.go:Symbol" + strconv.Itoa(i) + ":function",
+				Model:    "bench",
+				Vector:   vec,
+			})
+		}
+		return items
+	}
+
+	st := openBenchStoreWithOptions(b, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedBenchSymbols(b, st, total, 0)
+	if err := st.UpsertEmbeddingsBatch(makeItems()); err != nil {
+		b.Fatal(err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		st.BeginDeferredANNSync()
+		items := makeItems()
+		for start := 0; start < len(items); start += batchSize {
+			end := start + batchSize
+			if end > len(items) {
+				end = len(items)
+			}
+			if err := st.UpsertEmbeddingsBatch(items[start:end]); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := st.EndDeferredANNSync(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkUpsertEmbeddingsBatchWithImmediateANNSync_10k(b *testing.B) {
+	const (
+		dims      = 768
+		total     = 10_000
+		batchSize = 64
+	)
+
+	makeItems := func() []EmbeddingItem {
+		items := make([]EmbeddingItem, 0, total)
+		for i := 0; i < total; i++ {
+			vec := make([]float32, dims)
+			for j := range vec {
+				vec[j] = float32(i+j) / 1000
+			}
+			items = append(items, EmbeddingItem{
+				SymbolID: "bench.go:Symbol" + strconv.Itoa(i) + ":function",
+				Model:    "bench",
+				Vector:   vec,
+			})
+		}
+		return items
+	}
+
+	st := openBenchStoreWithOptions(b, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedBenchSymbols(b, st, total, 0)
+	if err := st.UpsertEmbeddingsBatch(makeItems()); err != nil {
+		b.Fatal(err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		items := makeItems()
+		for start := 0; start < len(items); start += batchSize {
+			end := start + batchSize
+			if end > len(items) {
+				end = len(items)
+			}
+			if err := st.UpsertEmbeddingsBatch(items[start:end]); err != nil {
+				b.Fatal(err)
+			}
+		}
 	}
 }
 
@@ -485,6 +730,754 @@ func TestSearchSemantic_ReturnsClosestVector(t *testing.T) {
 	}
 	if got[0].Name != "Near" {
 		t.Errorf("top result = %q, want %q", got[0].Name, "Near")
+	}
+}
+
+func TestSearchSemantic_ANNModeFallsBackToBruteForce(t *testing.T) {
+	st := openTestStoreWithOptions(t, OpenOptions{SemanticMode: SemanticModeANN})
+	seedFile(t, st,
+		types.FileRecord{Path: "fallback.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "fallback.go:Near:function", File: "fallback.go", Name: "Near", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "fallback.go:Far:function", File: "fallback.go", Name: "Far", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+
+	query := []float32{1, 0, 0}
+	if err := st.UpsertEmbedding("fallback.go:Near:function", "m", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding() error = %v", err)
+	}
+	if err := st.UpsertEmbedding("fallback.go:Far:function", "m", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding() error = %v", err)
+	}
+
+	got, err := st.SearchSemantic(query, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("SearchSemantic() returned no results")
+	}
+	if got[0].Name != "Near" {
+		t.Fatalf("top result = %q, want Near", got[0].Name)
+	}
+	if st.semanticMode != SemanticModeBruteForce {
+		t.Fatalf("semanticMode = %q, want fallback to %q", st.semanticMode, SemanticModeBruteForce)
+	}
+}
+
+func TestSearchSemantic_ANNModeUsesANNSearcherWhenAvailable(t *testing.T) {
+	origFactory := newANNSemanticSearcher
+	t.Cleanup(func() { newANNSemanticSearcher = origFactory })
+
+	newANNSemanticSearcher = func(_ *Store) (semanticSearcher, error) {
+		return stubSemanticSearcher{candidates: []semanticCandidate{{rowid: 0, score: 1}}}, nil
+	}
+
+	st := openTestStoreWithOptions(t, OpenOptions{SemanticMode: SemanticModeANN})
+	if st.semanticMode != SemanticModeANN {
+		t.Fatalf("semanticMode = %q, want %q", st.semanticMode, SemanticModeANN)
+	}
+	if _, ok := st.semanticSearcher.(stubSemanticSearcher); !ok {
+		t.Fatalf("semanticSearcher type = %T, want stubSemanticSearcher", st.semanticSearcher)
+	}
+}
+
+func TestANNArtifactPaths_UseCtxppSiblingFiles(t *testing.T) {
+	paths := annArtifactPaths(filepath.Join("repo", ".ctxpp", "index.db"))
+	if paths.Index != filepath.Join("repo", ".ctxpp", "ann-hnsw.bin") {
+		t.Fatalf("Index path = %q, want %q", paths.Index, filepath.Join("repo", ".ctxpp", "ann-hnsw.bin"))
+	}
+	if paths.Metadata != filepath.Join("repo", ".ctxpp", "ann-hnsw.json") {
+		t.Fatalf("Metadata path = %q, want %q", paths.Metadata, filepath.Join("repo", ".ctxpp", "ann-hnsw.json"))
+	}
+}
+
+func TestSearchSemantic_ANNModeLoadsHNSWArtifactsWhenPresent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	seedStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, seedStore,
+		types.FileRecord{Path: "load.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "load.go:Only:function", File: "load.go", Name: "Only", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	if err := seedStore.UpsertEmbedding("load.go:Only:function", "test-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding() error = %v", err)
+	}
+	var rowID int64
+	if err := seedStore.rdb.QueryRow(`SELECT rowid FROM embeddings WHERE symbol_id=?`, "load.go:Only:function").Scan(&rowID); err != nil {
+		t.Fatalf("rowid lookup error = %v", err)
+	}
+	paths := annArtifactPaths(dbPath)
+	if err := os.MkdirAll(filepath.Dir(paths.Index), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	meta := annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW, Model: "test-model", Dims: 3, Count: 1}
+	if err := writeANNMetadata(paths.Metadata, meta); err != nil {
+		t.Fatalf("writeANNMetadata() error = %v", err)
+	}
+	g := hnsw.NewGraph[int64]()
+	g.Add(hnsw.MakeNode(rowID, []float32{1, 0, 0}))
+	f, err := os.Create(paths.Index)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := g.Export(f); err != nil {
+		_ = f.Close()
+		t.Fatalf("Export() error = %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	if st.semanticMode != SemanticModeANN {
+		t.Fatalf("semanticMode = %q, want %q", st.semanticMode, SemanticModeANN)
+	}
+	if _, ok := st.semanticSearcher.(*hnswSemanticSearcher); !ok {
+		t.Fatalf("semanticSearcher type = %T, want *hnswSemanticSearcher", st.semanticSearcher)
+	}
+}
+
+func TestSearchSemantic_ANNModeSearchesUsingHNSWArtifact(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	paths := annArtifactPaths(dbPath)
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "ann.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "ann.go:Near:function", File: "ann.go", Name: "Near", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "ann.go:Far:function", File: "ann.go", Name: "Far", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+	if err := st.UpsertEmbedding("ann.go:Near:function", "m", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(near) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("ann.go:Far:function", "m", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(far) error = %v", err)
+	}
+
+	var nearRowID, farRowID int64
+	if err := st.rdb.QueryRow(`SELECT rowid FROM embeddings WHERE symbol_id=?`, "ann.go:Near:function").Scan(&nearRowID); err != nil {
+		t.Fatalf("near rowid lookup error = %v", err)
+	}
+	if err := st.rdb.QueryRow(`SELECT rowid FROM embeddings WHERE symbol_id=?`, "ann.go:Far:function").Scan(&farRowID); err != nil {
+		t.Fatalf("far rowid lookup error = %v", err)
+	}
+
+	g := hnsw.NewGraph[int64]()
+	g.Add(
+		hnsw.MakeNode(nearRowID, []float32{1, 0, 0}),
+		hnsw.MakeNode(farRowID, []float32{0, 0, 1}),
+	)
+	if err := os.MkdirAll(filepath.Dir(paths.Index), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	f, err := os.Create(paths.Index)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := g.Export(f); err != nil {
+		_ = f.Close()
+		t.Fatalf("Export() error = %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := writeANNMetadata(paths.Metadata, annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW}); err != nil {
+		t.Fatalf("writeANNMetadata() error = %v", err)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchSemantic() returned %d results, want 2", len(got))
+	}
+	if got[0].Name != "Near" {
+		t.Fatalf("top result = %q, want Near", got[0].Name)
+	}
+}
+
+func TestBuildHNSWArtifactsFromEmbeddings_WritesSearchableIndexAndMetadata(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "build.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "build.go:Near:function", File: "build.go", Name: "Near", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "build.go:Far:function", File: "build.go", Name: "Far", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+	if err := st.UpsertEmbedding("build.go:Near:function", "test-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(near) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("build.go:Far:function", "test-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(far) error = %v", err)
+	}
+
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	paths := annArtifactPaths(dbPath)
+	if _, err := os.Stat(paths.Index); err != nil {
+		t.Fatalf("Stat(index) error = %v", err)
+	}
+	meta, err := readANNMetadata(paths.Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.FormatVersion != annFormatVersion {
+		t.Fatalf("FormatVersion = %d, want %d", meta.FormatVersion, annFormatVersion)
+	}
+	if meta.Engine != annEngineHNSW {
+		t.Fatalf("Engine = %q, want %q", meta.Engine, annEngineHNSW)
+	}
+	if meta.Model != "test-model" {
+		t.Fatalf("Model = %q, want test-model", meta.Model)
+	}
+	if meta.Dims != 3 {
+		t.Fatalf("Dims = %d, want 3", meta.Dims)
+	}
+	if meta.Count != 2 {
+		t.Fatalf("Count = %d, want 2", meta.Count)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchSemantic() returned %d results, want 2", len(got))
+	}
+	if got[0].Name != "Near" {
+		t.Fatalf("top result = %q, want Near", got[0].Name)
+	}
+}
+
+func TestSearchSemantic_ANNModeRebuildsArtifactsWhenMetadataIsStale(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "rebuild.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "rebuild.go:Near:function", File: "rebuild.go", Name: "Near", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "rebuild.go:Far:function", File: "rebuild.go", Name: "Far", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+	if err := st.UpsertEmbedding("rebuild.go:Near:function", "fresh-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(near) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("rebuild.go:Far:function", "fresh-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(far) error = %v", err)
+	}
+
+	paths := annArtifactPaths(dbPath)
+	if err := os.MkdirAll(filepath.Dir(paths.Index), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	g := hnsw.NewGraph[int64]()
+	g.Add(hnsw.MakeNode(int64(1), []float32{1, 0, 0}))
+	f, err := os.Create(paths.Index)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := g.Export(f); err != nil {
+		_ = f.Close()
+		t.Fatalf("Export() error = %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := writeANNMetadata(paths.Metadata, annMetadata{FormatVersion: annFormatVersion, Engine: annEngineHNSW, Model: "stale-model", Dims: 3, Count: 1}); err != nil {
+		t.Fatalf("writeANNMetadata() error = %v", err)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	if annStore.semanticMode != SemanticModeANN {
+		t.Fatalf("semanticMode = %q, want %q", annStore.semanticMode, SemanticModeANN)
+	}
+	meta, err := readANNMetadata(paths.Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Model != "fresh-model" {
+		t.Fatalf("Model = %q, want fresh-model", meta.Model)
+	}
+	if meta.Count != 2 {
+		t.Fatalf("Count = %d, want 2", meta.Count)
+	}
+	got, err := annStore.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchSemantic() returned %d results, want 2", len(got))
+	}
+	if got[0].Name != "Near" {
+		t.Fatalf("top result = %q, want Near", got[0].Name)
+	}
+}
+
+func TestUpsertEmbedding_RebuildsExistingANNArtifacts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "sync.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "sync.go:Near:function", File: "sync.go", Name: "Near", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "sync.go:Far:function", File: "sync.go", Name: "Far", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+			{ID: "sync.go:New:function", File: "sync.go", Name: "New", Kind: types.KindFunction, StartLine: 5, EndLine: 6},
+		},
+	)
+	if err := st.UpsertEmbedding("sync.go:Near:function", "sync-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(near) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("sync.go:Far:function", "sync-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(far) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	if err := st.UpsertEmbedding("sync.go:New:function", "sync-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(new) error = %v", err)
+	}
+
+	meta, err := readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Count != 3 {
+		t.Fatalf("Count = %d, want 3", meta.Count)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchSemantic() returned %d results, want 2", len(got))
+	}
+	if got[0].Name != "Near" && got[0].Name != "New" {
+		t.Fatalf("top result = %q, want Near or New after ANN sync", got[0].Name)
+	}
+	if got[1].Name != "Near" && got[1].Name != "New" {
+		t.Fatalf("second result = %q, want Near or New after ANN sync", got[1].Name)
+	}
+}
+
+func TestDeleteFile_RebuildsExistingANNArtifacts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "keep.go", SHA256: "a", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "keep.go:Keep:function", File: "keep.go", Name: "Keep", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	seedFile(t, st,
+		types.FileRecord{Path: "drop.go", SHA256: "b", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "drop.go:Drop:function", File: "drop.go", Name: "Drop", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	if err := st.UpsertEmbedding("keep.go:Keep:function", "sync-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(keep) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("drop.go:Drop:function", "sync-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(drop) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	if err := st.DeleteFile("drop.go"); err != nil {
+		t.Fatalf("DeleteFile() error = %v", err)
+	}
+
+	meta, err := readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Count != 1 {
+		t.Fatalf("Count = %d, want 1", meta.Count)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("SearchSemantic() returned %d results, want 1", len(got))
+	}
+	if got[0].Name != "Keep" {
+		t.Fatalf("top result = %q, want Keep", got[0].Name)
+	}
+}
+
+func TestDeleteSymbolsByFile_UpdatesANNMetadataAndResults(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "gone.go", SHA256: "a", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "gone.go:Gone:function", File: "gone.go", Name: "Gone", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	seedFile(t, st,
+		types.FileRecord{Path: "stay.go", SHA256: "b", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "stay.go:Stay:function", File: "stay.go", Name: "Stay", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	if err := st.UpsertEmbedding("gone.go:Gone:function", "delete-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(gone) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("stay.go:Stay:function", "delete-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(stay) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	if err := st.DeleteSymbolsByFile("gone.go"); err != nil {
+		t.Fatalf("DeleteSymbolsByFile() error = %v", err)
+	}
+
+	meta, err := readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Count != 1 {
+		t.Fatalf("Count = %d, want 1", meta.Count)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("SearchSemantic() returned %d results, want 1", len(got))
+	}
+	if got[0].Name != "Stay" {
+		t.Fatalf("top result = %q, want Stay", got[0].Name)
+	}
+}
+
+func TestSearchSemantic_AutoModeUsesANNWhenArtifactsAreValid(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "auto.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "auto.go:Near:function", File: "auto.go", Name: "Near", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "auto.go:Far:function", File: "auto.go", Name: "Far", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+	if err := st.UpsertEmbedding("auto.go:Near:function", "auto-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(near) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("auto.go:Far:function", "auto-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(far) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	autoStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeAuto})
+	if autoStore.semanticMode != SemanticModeANN {
+		t.Fatalf("semanticMode = %q, want %q", autoStore.semanticMode, SemanticModeANN)
+	}
+	if _, ok := autoStore.semanticSearcher.(*hnswSemanticSearcher); !ok {
+		t.Fatalf("semanticSearcher type = %T, want *hnswSemanticSearcher", autoStore.semanticSearcher)
+	}
+	got, err := autoStore.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchSemantic() returned %d results, want 2", len(got))
+	}
+	if got[0].Name != "Near" {
+		t.Fatalf("top result = %q, want Near", got[0].Name)
+	}
+}
+
+func TestDeferredANNSync_BatchesArtifactRefreshUntilEnd(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "defer.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "defer.go:Old:function", File: "defer.go", Name: "Old", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "defer.go:New:function", File: "defer.go", Name: "New", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+	if err := st.UpsertEmbedding("defer.go:Old:function", "defer-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(old) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	st.BeginDeferredANNSync()
+	if err := st.UpsertEmbedding("defer.go:New:function", "defer-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(new) error = %v", err)
+	}
+
+	meta, err := readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Count != 1 {
+		t.Fatalf("Count = %d, want 1 before deferred sync flush", meta.Count)
+	}
+	if err := st.EndDeferredANNSync(); err != nil {
+		t.Fatalf("EndDeferredANNSync() error = %v", err)
+	}
+
+	meta, err = readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() after flush error = %v", err)
+	}
+	if meta.Count != 2 {
+		t.Fatalf("Count = %d, want 2 after deferred sync flush", meta.Count)
+	}
+}
+
+func TestDeferredANNSync_FlushesIncrementalDeletesAndUpserts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "flush.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "flush.go:Old:function", File: "flush.go", Name: "Old", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "flush.go:Keep:function", File: "flush.go", Name: "Keep", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+			{ID: "flush.go:New:function", File: "flush.go", Name: "New", Kind: types.KindFunction, StartLine: 5, EndLine: 6},
+		},
+	)
+	if err := st.UpsertEmbedding("flush.go:Old:function", "flush-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(old) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("flush.go:Keep:function", "flush-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(keep) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	st.BeginDeferredANNSync()
+	if err := st.DeleteSymbolsByFile("flush.go"); err != nil {
+		t.Fatalf("DeleteSymbolsByFile() error = %v", err)
+	}
+	if err := st.UpsertSymbolsBatch([]types.Symbol{
+		{ID: "flush.go:Keep:function", File: "flush.go", Name: "Keep", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+		{ID: "flush.go:New:function", File: "flush.go", Name: "New", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+	}); err != nil {
+		t.Fatalf("UpsertSymbolsBatch() error = %v", err)
+	}
+	if err := st.UpsertEmbedding("flush.go:Keep:function", "flush-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(keep) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("flush.go:New:function", "flush-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(new) error = %v", err)
+	}
+	if err := st.EndDeferredANNSync(); err != nil {
+		t.Fatalf("EndDeferredANNSync() error = %v", err)
+	}
+
+	meta, err := readANNMetadata(annArtifactPaths(dbPath).Metadata)
+	if err != nil {
+		t.Fatalf("readANNMetadata() error = %v", err)
+	}
+	if meta.Count != 2 {
+		t.Fatalf("Count = %d, want 2", meta.Count)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{1, 0, 0}, 3)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchSemantic() returned %d results, want 2", len(got))
+	}
+	if got[0].Name != "Keep" && got[0].Name != "New" {
+		t.Fatalf("top result = %q, want Keep or New", got[0].Name)
+	}
+	if got[1].Name != "Keep" && got[1].Name != "New" {
+		t.Fatalf("second result = %q, want Keep or New", got[1].Name)
+	}
+}
+
+func TestUpsertParsedFile_RebuildsExistingANNArtifacts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "parsed.go", SHA256: "v1", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "parsed.go:Old:func", File: "parsed.go", Name: "Old", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	if err := st.UpsertEmbedding("parsed.go:Old:func", "parsed-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(old) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	pf := ParsedFileData{
+		File:    types.FileRecord{Path: "parsed.go", SHA256: "v2", ModTime: 2, Lang: "go"},
+		Symbols: []types.Symbol{{ID: "parsed.go:New:func", File: "parsed.go", Name: "New", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	}
+	if err := st.UpsertParsedFile(pf); err != nil {
+		t.Fatalf("UpsertParsedFile() error = %v", err)
+	}
+
+	paths := annArtifactPaths(dbPath)
+	if _, err := os.Stat(paths.Metadata); !os.IsNotExist(err) {
+		t.Fatalf("Stat(metadata) error = %v, want not exists", err)
+	}
+	if err := st.UpsertEmbedding("parsed.go:New:func", "parsed-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(new) error = %v", err)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("SearchSemantic() returned %d results, want 1", len(got))
+	}
+	if got[0].Name != "New" {
+		t.Fatalf("top result = %q, want New", got[0].Name)
+	}
+}
+
+func TestUpsertParsedFileBatch_RebuildsExistingANNArtifacts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), ".ctxpp", "index.db")
+	st := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeBruteForce})
+	seedFile(t, st,
+		types.FileRecord{Path: "batch.go", SHA256: "v1", ModTime: 1, Lang: "go"},
+		[]types.Symbol{{ID: "batch.go:Old:func", File: "batch.go", Name: "Old", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	)
+	if err := st.UpsertEmbedding("batch.go:Old:func", "batch-model", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(old) error = %v", err)
+	}
+	if err := st.BuildANNArtifacts(); err != nil {
+		t.Fatalf("BuildANNArtifacts() error = %v", err)
+	}
+
+	files := []ParsedFileData{{
+		File:    types.FileRecord{Path: "batch.go", SHA256: "v2", ModTime: 2, Lang: "go"},
+		Symbols: []types.Symbol{{ID: "batch.go:Fresh:func", File: "batch.go", Name: "Fresh", Kind: types.KindFunction, StartLine: 1, EndLine: 2}},
+	}}
+	if err := st.UpsertParsedFileBatch(files); err != nil {
+		t.Fatalf("UpsertParsedFileBatch() error = %v", err)
+	}
+
+	paths := annArtifactPaths(dbPath)
+	if _, err := os.Stat(paths.Metadata); !os.IsNotExist(err) {
+		t.Fatalf("Stat(metadata) error = %v, want not exists", err)
+	}
+	if err := st.UpsertEmbedding("batch.go:Fresh:func", "batch-model", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(fresh) error = %v", err)
+	}
+
+	annStore := openTestStoreAtPath(t, dbPath, OpenOptions{SemanticMode: SemanticModeANN})
+	got, err := annStore.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("SearchSemantic() returned %d results, want 1", len(got))
+	}
+	if got[0].Name != "Fresh" {
+		t.Fatalf("top result = %q, want Fresh", got[0].Name)
+	}
+}
+
+func TestSearchSemantic_UsesConfiguredSearcher(t *testing.T) {
+	st := openTestStore(t)
+	seedFile(t, st,
+		types.FileRecord{Path: "cfg.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "cfg.go:Alpha:function", File: "cfg.go", Name: "Alpha", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "cfg.go:Beta:function", File: "cfg.go", Name: "Beta", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+
+	var alphaRowID, betaRowID int64
+	if err := st.UpsertEmbedding("cfg.go:Alpha:function", "m", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(alpha) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("cfg.go:Beta:function", "m", []float32{0, 1, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(beta) error = %v", err)
+	}
+	if err := st.rdb.QueryRow(`SELECT rowid FROM embeddings WHERE symbol_id=?`, "cfg.go:Alpha:function").Scan(&alphaRowID); err != nil {
+		t.Fatalf("rowid alpha lookup error = %v", err)
+	}
+	if err := st.rdb.QueryRow(`SELECT rowid FROM embeddings WHERE symbol_id=?`, "cfg.go:Beta:function").Scan(&betaRowID); err != nil {
+		t.Fatalf("rowid beta lookup error = %v", err)
+	}
+
+	st.semanticSearcher = stubSemanticSearcher{candidates: []semanticCandidate{
+		{rowid: betaRowID, score: 0.95},
+	}}
+
+	got, err := st.SearchSemantic([]float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("SearchSemantic() returned %d results, want 1", len(got))
+	}
+	if got[0].Name != "Beta" {
+		t.Fatalf("top result = %q, want Beta", got[0].Name)
+	}
+}
+
+func TestSearchSemantic_RecomputesExactScoresAfterCandidateGeneration(t *testing.T) {
+	st := openTestStore(t)
+	seedFile(t, st,
+		types.FileRecord{Path: "rerank.go", SHA256: "q", ModTime: 1, Lang: "go"},
+		[]types.Symbol{
+			{ID: "rerank.go:Near:function", File: "rerank.go", Name: "Near", Kind: types.KindFunction, StartLine: 1, EndLine: 2},
+			{ID: "rerank.go:Far:function", File: "rerank.go", Name: "Far", Kind: types.KindFunction, StartLine: 3, EndLine: 4},
+		},
+	)
+
+	query := []float32{1, 0, 0}
+	if err := st.UpsertEmbedding("rerank.go:Near:function", "m", []float32{1, 0, 0}); err != nil {
+		t.Fatalf("UpsertEmbedding(near) error = %v", err)
+	}
+	if err := st.UpsertEmbedding("rerank.go:Far:function", "m", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("UpsertEmbedding(far) error = %v", err)
+	}
+
+	var nearRowID, farRowID int64
+	if err := st.rdb.QueryRow(`SELECT rowid FROM embeddings WHERE symbol_id=?`, "rerank.go:Near:function").Scan(&nearRowID); err != nil {
+		t.Fatalf("rowid near lookup error = %v", err)
+	}
+	if err := st.rdb.QueryRow(`SELECT rowid FROM embeddings WHERE symbol_id=?`, "rerank.go:Far:function").Scan(&farRowID); err != nil {
+		t.Fatalf("rowid far lookup error = %v", err)
+	}
+
+	st.semanticSearcher = stubSemanticSearcher{candidates: []semanticCandidate{
+		{rowid: farRowID, score: 0.99},
+		{rowid: nearRowID, score: 0.01},
+	}}
+
+	got, err := st.SearchSemantic(query, 2)
+	if err != nil {
+		t.Fatalf("SearchSemantic() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchSemantic() returned %d results, want 2", len(got))
+	}
+	if got[0].Name != "Near" {
+		t.Fatalf("top result = %q, want Near after exact rerank", got[0].Name)
+	}
+	if got[1].Name != "Far" {
+		t.Fatalf("second result = %q, want Far after exact rerank", got[1].Name)
 	}
 }
 

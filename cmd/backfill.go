@@ -103,6 +103,13 @@ func runBackfill(path string) {
 		skipped int
 	)
 	start := time.Now()
+	st.BeginDeferredANNSync()
+	defer func() {
+		if err := st.EndDeferredANNSync(); err != nil {
+			fmt.Fprintf(os.Stderr, "EndDeferredANNSync: %v\n", err)
+			os.Exit(1)
+		}
+	}()
 
 	for lo := 0; lo < len(ids); lo += batchSize {
 		hi := lo + batchSize

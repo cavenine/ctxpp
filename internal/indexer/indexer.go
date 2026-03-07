@@ -167,6 +167,12 @@ type embedResult struct {
 func (idx *Indexer) Index(ctx context.Context) (IndexStats, error) {
 	start := time.Now()
 	gi := loadGitignore(idx.cfg.ProjectRoot)
+	idx.store.BeginDeferredANNSync()
+	defer func() {
+		if err := idx.store.EndDeferredANNSync(); err != nil {
+			idx.log.Warn("flush deferred ann sync", "err", err)
+		}
+	}()
 
 	// Skip the entire embed pipeline when the embedder is a non-functional stub.
 	// This avoids writing millions of zero-vector bytes to SQLite and removes
